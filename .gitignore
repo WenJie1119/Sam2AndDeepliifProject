@@ -9,3 +9,24 @@ _C.*
 outputs/*
 checkpoints/*.pt
 demo/backend/checkpoints/*.pt
+
+# --- Custom Ignores ---
+# Model weights
+*.pth
+*.pt
+*.onnx
+
+# Images
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.svs
+
+# Data and Artifacts
+checkpoints/
+deepliif_models/
+test_results/
+__pycache__/
+*.pyc

@@ -25,8 +25,8 @@ demo/backend/checkpoints/*.pt
 *.svs
 
 # Data and Artifacts
-checkpoints/
-deepliif_models/
-test_results/
+# checkpoints/ -> handled by local .gitignore
+# deepliif_models/ -> handled by local .gitignore
+# test_results/ -> handled by local .gitignore
 __pycache__/
 *.pyc

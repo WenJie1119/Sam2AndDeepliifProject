@@ -180,3 +180,66 @@ def tensor_to_pil(tensor):
     else:
         image_numpy = tensor
     return Image.fromarray(image_numpy.astype(np.uint8))
+
+
+def image_variance_gray(img):
+    """
+    Calculate the variance of grayscale image pixels, excluding pure white and black.
+    Matches original DeepLIIF implementation.
+    
+    Args:
+        img: PIL Image
+        
+    Returns:
+        Variance of non-white, non-black pixels
+    """
+    px = np.asarray(img) if img.mode == 'L' else np.asarray(img.convert('L'))
+    idx = np.logical_and(px != 255, px != 0)
+    val = px[idx]
+    if val.shape[0] == 0:
+        return 0
+    var = np.var(val)
+    return var
+
+
+def is_empty(tile, thresh=9):
+    """
+    Check if a tile is empty (low variance, likely background).
+    Matches original DeepLIIF implementation.
+    
+    Args:
+        tile: PIL Image or list of PIL Images
+        thresh: Variance threshold (default: 9)
+        
+    Returns:
+        True if tile is considered empty/background
+    """
+    if isinstance(tile, list):
+        # For multiple tiles, mark as empty only if ALL are empty
+        return all([True if image_variance_gray(t) < thresh else False for t in tile])
+    else:
+        return True if image_variance_gray(tile) < thresh else False
+
+
+def get_empty_result_tiles(tile_size=512):
+    """
+    Generate placeholder result tiles for empty/background regions.
+    Matches original DeepLIIF background colors.
+    
+    Args:
+        tile_size: Size of the tile
+        
+    Returns:
+        Dictionary of empty result images for each modality
+    """
+    from PIL import Image
+    
+    # Background colors from original DeepLIIF
+    # G1=Hema, G2=DAPI, G3=Lap2, G4=Marker, Seg=black
+    return {
+        'Hema': Image.new(mode='RGB', size=(tile_size, tile_size), color=(201, 211, 208)),
+        'DAPI': Image.new(mode='RGB', size=(tile_size, tile_size), color=(10, 10, 10)),
+        'Lap2': Image.new(mode='RGB', size=(tile_size, tile_size), color=(0, 0, 0)),
+        'Marker': Image.new(mode='RGB', size=(tile_size, tile_size), color=(10, 10, 10)),
+        'Seg': Image.new(mode='RGB', size=(tile_size, tile_size), color=(0, 0, 0)),
+    }

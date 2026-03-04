@@ -1,7 +1,7 @@
 import os
 import torch
 from PIL import Image
-from .utils import disable_batchnorm_tracking_stats, get_transform, tensor_to_pil, InferenceTiler
+from .utils import disable_batchnorm_tracking_stats, get_transform, tensor_to_pil, InferenceTiler, is_empty, get_empty_result_tiles
 
 class DeepLIIFInference:
     """
@@ -70,6 +70,13 @@ class DeepLIIFInference:
         
         # Iterate over tiles
         for tile in tiler:
+            # 0. Empty tile detection - skip processing for background tiles (matches original DeepLIIF)
+            if is_empty(tile):
+                # Use placeholder images for empty/background tiles
+                tile_results = get_empty_result_tiles(tile_size)
+                tiler.stitch(tile_results)
+                continue
+            
             # 1. Preprocess tile
             ts = self.transform(tile).to(self.device)
             
@@ -95,8 +102,9 @@ class DeepLIIFInference:
             # 4. Aggregate Segmentation
             if seg_results_ts:
                 if seg_weights is None:
-                    weight = 1.0 / len(seg_results_ts)
-                    weights = [weight] * len(seg_results_ts)
+                    # Use original DeepLIIF default weights instead of equal weights
+                    # [G51=IHC, G52=Hema, G53=DAPI, G54=Lap2, G55=Marker]
+                    weights = [0.25, 0.15, 0.25, 0.1, 0.25]
                 else:
                     weights = seg_weights
                 

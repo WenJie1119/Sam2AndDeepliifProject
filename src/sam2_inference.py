@@ -209,16 +209,47 @@ def run_sam2_grouped_segmentation(predictor, image: np.ndarray, cell_groups: lis
                 multimask_output=True
             )
             
-            best_idx = int(np.argmax(scores))
+            # ========== 面积优先选择策略 ==========
+            # 计算每个候选 mask 的面积比例（相对于输入）
+            mask_areas = [int(np.sum(m)) for m in masks]
+            area_ratios = [a / total_pixels if total_pixels > 0 else 0 for a in mask_areas]
+            
+            # 理想面积比例范围：0.5 ~ 5.0（允许 SAM2 适度调整边界）
+            # 优先选择面积比例接近 1.5 的 mask（SAM2 通常会稍微扩张）
+            ideal_ratio = 1.5
+            min_ratio = 0.3
+            max_ratio = 10.0
+            
+            # 计算每个 mask 的综合得分：面积合理性 + 置信度
+            selection_scores = []
+            for i, (score, ratio) in enumerate(zip(scores, area_ratios)):
+                if ratio < min_ratio or ratio > max_ratio:
+                    # 面积比例异常，大幅降低分数
+                    combined_score = -1.0
+                else:
+                    # 面积偏离度（越接近 ideal_ratio 越好）
+                    ratio_penalty = abs(np.log(ratio / ideal_ratio))  # log 尺度惩罚
+                    # 综合得分 = 置信度 - 面积偏离惩罚
+                    combined_score = float(score) - 0.3 * ratio_penalty
+                selection_scores.append(combined_score)
+            
+            best_idx = int(np.argmax(selection_scores))
             best_score = float(scores[best_idx])
             best_mask = masks[best_idx].astype(bool)
-            mask_area = np.sum(best_mask)
+            mask_area = mask_areas[best_idx]
+            best_ratio = area_ratios[best_idx]
+            
+            # 如果所有 mask 的面积比例都异常，则跳过这个组
+            if max(selection_scores) < -0.5:
+                print(f"      Group {group_id} (cells: {member_ids}): ALL masks have abnormal area ratio! Ratios={[f'{r:.1f}' for r in area_ratios]} [SKIPPED]")
+                filtered_list.append((group_id, best_score))
+                continue
             
             # Save step results
             if save_steps_dir:
                 _save_grouped_step_results(
                     save_steps_dir, group_id, image, merged_coords, mask_input,
-                    masks, scores, best_idx, member_ids
+                    masks, scores, best_idx, member_ids, member_cells
                 )
                 steps_summary.append({
                     'group_id': int(group_id),
@@ -226,9 +257,12 @@ def run_sam2_grouped_segmentation(predictor, image: np.ndarray, cell_groups: lis
                     'num_cells': len(member_ids),
                     'total_input_pixels': int(total_pixels),
                     'scores': [float(s) for s in scores],
+                    'selection_scores': [float(s) for s in selection_scores],
+                    'area_ratios': [float(r) for r in area_ratios],
                     'best_idx': int(best_idx),
                     'best_score': float(best_score),
-                    'mask_areas': [int(np.sum(m)) for m in masks],
+                    'best_ratio': float(best_ratio),
+                    'mask_areas': mask_areas,
                     'best_mask_area': int(mask_area)
                 })
             
@@ -248,7 +282,7 @@ def run_sam2_grouped_segmentation(predictor, image: np.ndarray, cell_groups: lis
             final_area = np.sum(combined_mask == group_id)
             cells_str = str(member_ids) if len(member_ids) <= 3 else f"{member_ids[:3]}...({len(member_ids)} cells)"
             num_points = len(point_coords)
-            print(f"      Group {group_id} {cells_str}: score={best_score:.4f}, area={mask_area} [final: {final_area}] (mode=multi_point+mask, {num_points}pts)")
+            print(f"      Group {group_id} {cells_str}: score={best_score:.4f}, ratio={best_ratio:.2f}x, area={mask_area} [final: {final_area}] ({num_points}pts)")
             
         except Exception as e:
             import traceback
@@ -270,7 +304,7 @@ def run_sam2_grouped_segmentation(predictor, image: np.ndarray, cell_groups: lis
 def _save_grouped_step_results(save_dir: str, group_id: int, image: np.ndarray,
                                 merged_coords: np.ndarray, mask_input: np.ndarray,
                                 masks: np.ndarray, scores: np.ndarray,
-                                best_idx: int, member_ids: list):
+                                best_idx: int, member_ids: list, member_cells: list):
     """保存分组 SAM2 推理的中间结果。"""
     import os
     

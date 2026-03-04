@@ -112,6 +112,8 @@ def parse_arguments() -> argparse.Namespace:
         help='Save side-by-side comparison of original image and final SAM2 result [default: OFF]')
     group_output.add_argument('--save-cell-extraction-vis', action='store_true',
         help='Save cell extraction visualization showing Seg analysis, pixel classification, and final cell labels [default: OFF]')
+    group_output.add_argument('--save-pipeline-vis', action='store_true',
+        help='Save detailed step-by-step pipeline visualization (step1-step5 images, CSV, summary) [default: OFF]')
     
     # SAM2 Mode Control Arguments
     group_sam_mode = parser.add_argument_group('SAM2 Mode Control',

@@ -209,16 +209,58 @@ def main():
                         show_labels=True
                     )
                 
+                # 详细的 pipeline 可视化 (如果启用) - 注意：需要先计算 filtered cells
+                # 这里先标记需要可视化，等 filter_positive_cells 执行后再保存
+                save_pipeline_vis_later = hasattr(args, 'save_pipeline_vis') and args.save_pipeline_vis
                 # 过滤阳性细胞 - 使用与 DeepLIIF 一致的动态阈值筛选
                 # [已注释] 原第二层筛选：
-                positive_cells_info = filter_positive_cells(all_cells_info, marker_sum_thresh=1000, marker_max_thresh=15)
+                filter_params = {
+                    'marker_sum_thresh': 1000,
+                    'marker_max_thresh': 30,
+                    'min_pixel_count': 100
+                }
+                positive_cells_info = filter_positive_cells(
+                    all_cells_info, 
+                    marker_sum_thresh=filter_params['marker_sum_thresh'], 
+                    marker_max_thresh=filter_params['marker_max_thresh'], 
+                    min_pixel_count=filter_params['min_pixel_count']
+                )
                 # 直接使用 is_positive 标志（由动态 marker_thresh 决定）
                 # positive_cells_info = [c for c in all_cells_info if c.get('is_positive', False)]
                 # print(f"    After dynamic marker filtering (is_positive=True): {len(positive_cells_info)} cells")
                 
+                # 保存 pipeline 可视化 (在 filter_positive_cells 之后，包含 Step 6)
+                if save_pipeline_vis_later:
+                    from src.pipeline_visualization import save_pipeline_visualization
+                    save_pipeline_visualization(
+                        seg_np, marker_np, all_cells_info,
+                        args.output_dir, base_name,
+                        seg_thresh=args.seg_thresh,
+                        marker_thresh=args.marker_thresh,
+                        original_image=original_np,
+                        filtered_cells_info=positive_cells_info,
+                        filter_params=filter_params
+                    )
+                
                 num_positive = len(positive_cells_info)
                 num_negative = len(all_cells_info) - num_positive
                 print(f"    Total cells: {len(all_cells_info)} (Positive: {num_positive}, Negative: {num_negative})")
+                
+                # 先检查是否有阳性细胞，如果没有就直接跳过后续处理
+                if num_positive == 0:
+                    print("    No positive cells after filtering. Skipping SAM2.")
+                    
+                    # 移动没有阳性细胞的图像到专门的文件夹
+                    no_positive_dir = os.path.join(args.output_dir, "no_positive_cells")
+                    os.makedirs(no_positive_dir, exist_ok=True)
+                    
+                    # 移动原始图像
+                    dest_path = os.path.join(no_positive_dir, img_name)
+                    if os.path.exists(img_path):
+                        shutil.move(img_path, dest_path)
+                        print(f"    Moved image with no positive cells to: {dest_path}")
+                    
+                    continue
                 
                 clusters = get_clusters_from_cells(positive_cells_info)
                 mask_np = create_binary_mask_from_cells(positive_cells_info, seg_np.shape)

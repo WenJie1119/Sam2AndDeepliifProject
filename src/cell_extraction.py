@@ -10,7 +10,107 @@ cell_extraction.py — 细胞提取与分类模块
 
 import numpy as np
 import cv2
-from typing import Optional
+from typing import Optional, Tuple
+
+
+# ============================================================================
+# 辅助函数 - 共享逻辑 (供 extract_cells_from_seg 和 pipeline_visualization 使用)
+# ============================================================================
+
+def compute_foreground_mask(seg_array: np.ndarray, 
+                            seg_thresh: int = 120) -> np.ndarray:
+    """
+    从 Seg RGB 图像计算前景掩码。
+    
+    前景条件: (R + B > seg_thresh) AND (G <= 80)
+    
+    Args:
+        seg_array: Seg 输出的 RGB 数组
+        seg_thresh: 前景检测阈值
+        
+    Returns:
+        布尔数组，True 表示前景像素
+    """
+    if seg_array.ndim == 3:
+        r_channel = seg_array[:,:,0].astype(int)
+        g_channel = seg_array[:,:,1].astype(int)
+        b_channel = seg_array[:,:,2].astype(int)
+        
+        sum_rb = r_channel + b_channel
+        is_foreground = (sum_rb > seg_thresh) & (g_channel <= 80)
+    else:
+        _, binary = cv2.threshold(seg_array, seg_thresh, 255, cv2.THRESH_BINARY)
+        is_foreground = binary > 0
+    
+    return is_foreground
+
+
+def compute_posneg_mask(seg_array: np.ndarray, 
+                        seg_thresh: int = 120) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    从 Seg RGB 图像计算阳性/阴性像素掩码和 R-B 差值。
+    
+    阳性像素条件: R >= B
+    
+    Args:
+        seg_array: Seg 输出的 RGB 数组
+        seg_thresh: 前景检测阈值
+        
+    Returns:
+        (posneg_mask, is_foreground, rb_diff) 元组:
+        - posneg_mask: 0=背景, 1=阴性, 2=阳性
+        - is_foreground: 布尔前景掩码
+        - rb_diff: R-B 差值数组
+    """
+    h, w = seg_array.shape[:2]
+    
+    if seg_array.ndim == 3:
+        r_channel = seg_array[:,:,0].astype(int)
+        g_channel = seg_array[:,:,1].astype(int)
+        b_channel = seg_array[:,:,2].astype(int)
+        
+        sum_rb = r_channel + b_channel
+        is_foreground = (sum_rb > seg_thresh) & (g_channel <= 80)
+        is_pos_pixel = r_channel >= b_channel
+        rb_diff = r_channel - b_channel
+        
+        # Create labeled mask: 0=background, 1=negative, 2=positive
+        posneg_mask = np.zeros((h, w), dtype=np.uint8)
+        posneg_mask[is_foreground & is_pos_pixel] = 2  # Positive
+        posneg_mask[is_foreground & ~is_pos_pixel] = 1  # Negative
+    else:
+        _, binary_mask = cv2.threshold(seg_array, seg_thresh, 255, cv2.THRESH_BINARY)
+        is_foreground = binary_mask > 0
+        posneg_mask = is_foreground.astype(np.uint8)
+        rb_diff = np.zeros((h, w), dtype=int)
+    
+    return posneg_mask, is_foreground, rb_diff
+
+
+def compute_marker_threshold(marker_gray: np.ndarray, 
+                             percentile_factor: float = 0.9) -> int:
+    """
+    自动计算 Marker 阈值。
+    
+    使用非零像素的 0.1%-99.9% 范围，取 90% 分位作为阈值。
+    
+    Args:
+        marker_gray: 灰度 Marker 图像
+        percentile_factor: 阈值在范围内的位置 (默认 0.9 = 90%)
+        
+    Returns:
+        计算得到的 Marker 阈值 (整数)
+    """
+    nonzero_marker = marker_gray[marker_gray > 0]
+    
+    if len(nonzero_marker) > 0:
+        marker_range_min = np.percentile(nonzero_marker, 0.1)
+        marker_range_max = np.percentile(nonzero_marker, 99.9)
+        marker_thresh = int((marker_range_max - marker_range_min) * percentile_factor + marker_range_min)
+    else:
+        marker_thresh = 128  # fallback
+    
+    return marker_thresh
 
 
 def extract_positive_cells_info(seg_refined_array: np.ndarray, 
@@ -113,28 +213,8 @@ def extract_cells_from_seg(seg_array: np.ndarray,
     else:
         marker_gray = marker_array.copy()
     
-    # === Step 1: Create pos/neg mask from Seg RGB (like DeepLIIF's create_posneg_mask) ===
-    if seg_array.ndim == 3:
-        r_channel = seg_array[:,:,0].astype(int)
-        g_channel = seg_array[:,:,1].astype(int)
-        b_channel = seg_array[:,:,2].astype(int)
-        
-        sum_rb = r_channel + b_channel
-        
-        # Foreground condition: (R + B > seg_thresh) and (G <= 80)
-        is_foreground = (sum_rb > seg_thresh) & (g_channel <= 80)
-        
-        # Positive pixel condition: R >= B
-        is_pos_pixel = r_channel >= b_channel
-        
-        # Create labeled mask: 0=background, 1=negative, 2=positive
-        posneg_mask = np.zeros_like(r_channel, dtype=np.uint8)
-        posneg_mask[is_foreground & is_pos_pixel] = 2  # Positive
-        posneg_mask[is_foreground & ~is_pos_pixel] = 1  # Negative
-    else:
-        # Grayscale fallback - treat all foreground as unknown
-        _, binary_mask = cv2.threshold(seg_array, seg_thresh, 255, cv2.THRESH_BINARY)
-        posneg_mask = (binary_mask > 0).astype(np.uint8)
+    # === Step 1: Create pos/neg mask from Seg RGB (使用共享辅助函数) ===
+    posneg_mask, is_foreground, rb_diff = compute_posneg_mask(seg_array, seg_thresh)
     
     # Binary mask for connected components (all foreground)
     binary_mask = ((posneg_mask > 0) * 255).astype(np.uint8)
@@ -142,18 +222,17 @@ def extract_cells_from_seg(seg_array: np.ndarray,
     # Connected components to find individual cells
     num_labels, labels = cv2.connectedComponents(binary_mask)
     
-    # Auto-calculate marker threshold if not provided (like DeepLIIF)
+    # Auto-calculate marker threshold if not provided (使用共享辅助函数)
     if marker_thresh is None:
-        # Use 90th percentile of non-zero marker values as threshold
+        marker_thresh = compute_marker_threshold(marker_gray)
         nonzero_marker = marker_gray[marker_gray > 0]
         if len(nonzero_marker) > 0:
             marker_range_min = np.percentile(nonzero_marker, 0.1)
             marker_range_max = np.percentile(nonzero_marker, 99.9)
-            marker_thresh = int((marker_range_max - marker_range_min) * 0.9 + marker_range_min)
             print(f"    [DEBUG] Auto marker_thresh: {marker_thresh} (range: {marker_range_min:.1f} - {marker_range_max:.1f})")
         else:
-            marker_thresh = 128  # fallback
             print(f"    [DEBUG] Fallback marker_thresh: {marker_thresh}")
+    
     
     cells_info = []
     for cell_id in range(1, num_labels):
@@ -206,7 +285,8 @@ def extract_cells_from_seg(seg_array: np.ndarray,
 
 def filter_positive_cells(cells_info: list[dict], 
                            marker_sum_thresh: int = 2000, 
-                           marker_max_thresh: int = 30) -> list[dict]:
+                           marker_max_thresh: int = 30,
+                           min_pixel_count: int = 100) -> list[dict]:
     """
     从所有细胞中过滤出满足条件的正向细胞。
     
@@ -214,6 +294,7 @@ def filter_positive_cells(cells_info: list[dict],
         cells_info: 所有细胞信息列表
         marker_sum_thresh: Marker Sum 阈值
         marker_max_thresh: Marker Max 阈值
+        min_pixel_count: 最小像素数阈值，低于此值的细胞会被排除
         
     Returns:
         满足条件的正向细胞列表
@@ -221,6 +302,7 @@ def filter_positive_cells(cells_info: list[dict],
     positive_cells = [
         c for c in cells_info 
         if c.get('is_positive', False) 
+        and c['pixel_count'] >= min_pixel_count
         and c['marker_sum'] > marker_sum_thresh 
         and c['marker_max'] >= marker_max_thresh
     ]

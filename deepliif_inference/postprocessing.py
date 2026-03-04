@@ -2,6 +2,9 @@ import math
 import numpy as np
 from PIL import Image
 
+# Import unified marker threshold function
+from src.cell_extraction import compute_marker_threshold
+
 # Default postprocessing values
 DEFAULT_SEG_THRESH = 120
 DEFAULT_NOISE_THRESH = 4
@@ -220,16 +223,8 @@ def calculate_default_size_threshold(cell_sizes, resolution='40x'):
     else:
         return 0
 
-def calculate_stain_range(stain):
-    nonzero = stain[stain != 0]
-    if nonzero.shape[0] > 0:
-        return (round(np.percentile(nonzero, 0.1)), round(np.percentile(nonzero, 99.9)))
-    else:
-        return (0, 0)
-
-def calculate_default_marker_threshold(marker):
-    marker_range = calculate_stain_range(marker)
-    return round((marker_range[1] - marker_range[0]) * 0.9) + marker_range[0]
+# Note: calculate_default_marker_threshold has been unified with compute_marker_threshold
+# from src.cell_extraction module
 
 def get_cells_info(seg, marker, resolution, noise_thresh, seg_thresh, large_noise_thresh):
     seg = to_array(seg)
@@ -244,7 +239,7 @@ def get_cells_info(seg, marker, resolution, noise_thresh, seg_thresh, large_nois
     sizes = np.array([c[0] for c in cellsinfo])
     defaults['size_thresh'] = calculate_default_size_threshold(sizes, resolution)
     if marker is not None:
-        defaults['marker_thresh'] = calculate_default_marker_threshold(marker)
+        defaults['marker_thresh'] = compute_marker_threshold(marker)
 
     return mask, cellsinfo, defaults
 

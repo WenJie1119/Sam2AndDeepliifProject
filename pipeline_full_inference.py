@@ -187,35 +187,27 @@ def main():
             if marker_img is not None:
                 marker_np = np.array(marker_img)
 
-                # ===== 方案1: 使用连通区域提取模式 =====
+                # ===== 连通区域提取模式: Seg+Marker联合 =====
                 if hasattr(args, 'use_connected_regions') and args.use_connected_regions:
-                    print(f"  > [Connected Region Mode] Extracting connected brown regions from Marker...")
-                    from src.cell_extraction import extract_brown_regions_from_marker
+                    print(f"  > [Connected Region Mode] Extracting connected positive regions (Seg+Marker)...")
+                    from src.cell_extraction import extract_connected_positive_regions
 
-                    # 将Marker转换为灰度图
-                    if marker_np.ndim == 3:
-                        marker_gray = cv2.cvtColor(marker_np, cv2.COLOR_RGB2GRAY)
-                    else:
-                        marker_gray = marker_np
-
-                    positive_cells_info = extract_brown_regions_from_marker(
-                        marker_gray,
-                        threshold=args.marker_region_thresh,
+                    positive_cells_info = extract_connected_positive_regions(
+                        seg_np, marker_np,
+                        seg_thresh=args.seg_thresh,
+                        marker_thresh=args.marker_thresh,
                         morphology_kernel=args.morphology_kernel,
                         min_area=args.min_mask_area
                     )
 
-                    print(f"    Found {len(positive_cells_info)} connected brown regions")
-                    print(f"    Parameters: threshold={args.marker_region_thresh}, kernel={args.morphology_kernel}, min_area={args.min_mask_area}")
+                    print(f"    Found {len(positive_cells_info)} connected positive regions")
+                    print(f"    Parameters: seg_thresh={args.seg_thresh}, kernel={args.morphology_kernel}, min_area={args.min_mask_area}")
 
-                    # 显示区域统计
                     if positive_cells_info:
                         areas = [c['pixel_count'] for c in positive_cells_info]
-                        markers = [c['marker_mean'] for c in positive_cells_info]
                         print(f"    Region sizes: min={min(areas)}, max={max(areas)}, mean={np.mean(areas):.0f} pixels")
-                        print(f"    Marker intensity: min={min(markers):.1f}, max={max(markers):.1f}, mean={np.mean(markers):.1f}")
 
-                    all_cells_info = positive_cells_info  # 兼容后续代码
+                    all_cells_info = positive_cells_info
 
                 # ===== 原有模式: 从Seg提取单个细胞 =====
                 else:

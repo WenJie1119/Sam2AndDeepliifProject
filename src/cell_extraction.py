@@ -628,36 +628,43 @@ def visualize_cell_extraction(seg_array: np.ndarray,
 
 
 # ============================================================================
-# 方案1: 直接从Marker提取连通的棕色区域（而非单个细胞）
+# Seg + Marker 联合提取连通阳性区域
 # ============================================================================
 
-def extract_brown_regions_from_marker(marker_np: np.ndarray,
-                                      threshold: int = 30,
-                                      morphology_kernel: int = 11,
-                                      min_area: int = 200) -> list:
+def extract_connected_positive_regions(seg_array: np.ndarray,
+                                        marker_array: np.ndarray,
+                                        seg_thresh: int = 120,
+                                        marker_thresh: Optional[int] = None,
+                                        morphology_kernel: int = 11,
+                                        min_area: int = 200) -> list:
     """
-    直接从Marker图像提取连通的棕色区域（而非单个细胞）
+    Seg + Marker 联合提取连通的阳性区域。
 
-    这个方法跳过细胞级分割，直接识别连续的棕色染色区域，
-    保持区域的连通性，避免将整块染色区域拆分成多个细胞。
+    与 extract_cells_from_seg 的区别：
+    - extract_cells_from_seg: 先 connectedComponents 拆成单细胞 → 逐个分类
+      → 连通的棕色区域被拆成多个独立细胞
+    - 本函数: 先标记所有阳性像素 → 形态学连接 → 再 connectedComponents
+      → 连通的棕色区域保持为一个整体
 
-    核心步骤：
-    1. 对Marker灰度图进行二值化（低阈值，捕获浅色棕色区域）
-    2. 形态学闭运算（关键！连接相邻的棕色像素形成整体）
-    3. 形态学开运算（去除小噪点）
-    4. 连通组件分析（提取每个连通区域）
+    流程：
+    1. 从 Seg 提取前景像素: (R+B > seg_thresh) && (G <= 80)
+    2. 在前景中，用 Seg 判断阳性像素: R >= B
+    3. 在阳性像素中，用 Marker 增强确认: marker > marker_thresh 的也标为阳性
+    4. 形态学闭运算：连接相邻的阳性像素（关键步骤！）
+    5. 形态学开运算：去除小噪点
+    6. 8-连通组件分析：提取每个连通区域作为整体
 
     Args:
-        marker_np: Marker灰度图 (H, W)，像素值越高表示棕色染色越强
-        threshold: 二值化阈值，越低越敏感，捕获更多浅色区域
-                  推荐值: 20-40 (默认30)
+        seg_array: DeepLIIF Seg 输出的 RGB 数组
+        marker_array: DeepLIIF Marker 输出（灰度或RGB）
+        seg_thresh: Seg 前景检测阈值 (默认120)
+        marker_thresh: Marker 阳性阈值。None = 自动计算
         morphology_kernel: 形态学闭运算核大小，越大连接性越强
                           推荐值: 7-15 (默认11)
-        min_area: 最小区域面积（像素数），过滤小碎片
-                 推荐值: 100-500 (默认200)
+        min_area: 最小区域面积（像素数），过滤小碎片 (默认200)
 
     Returns:
-        regions_info: 列表，每个元素是一个字典，包含：
+        regions_info: 列表，每个元素包含：
             - 'id': 区域ID (从1开始)
             - 'coords': 区域坐标 (N, 2) [row, col]
             - 'center': 中心坐标 (row, col)
@@ -665,63 +672,73 @@ def extract_brown_regions_from_marker(marker_np: np.ndarray,
             - 'marker_sum': marker值总和
             - 'marker_max': marker最大值
             - 'marker_mean': marker平均值
-            - 'bbox': 边界框 [y_min, y_max, x_min, x_max]
-            - 'is_positive': 布尔值，True（从Marker提取的都是阳性）
-
-    使用示例：
-        marker = np.array(deepliif_results['Marker'].convert('L'))
-        regions = extract_brown_regions_from_marker(
-            marker,
-            threshold=30,
-            morphology_kernel=11,
-            min_area=200
-        )
-        print(f"Found {len(regions)} connected brown regions")
+            - 'is_positive': True
     """
-    # 1. 二值化 - 将Marker转换为二值图
-    _, binary_mask = cv2.threshold(marker_np, threshold, 255, cv2.THRESH_BINARY)
+    # Marker 转灰度
+    if marker_array.ndim == 3:
+        marker_gray = cv2.cvtColor(marker_array, cv2.COLOR_RGB2GRAY)
+    else:
+        marker_gray = marker_array.copy()
 
-    # 2. 形态学闭运算 - 关键步骤！连接近邻的棕色像素
-    # 闭运算 = 先膨胀后腐蚀，能够填充小空洞，连接断开的区域
+    # 自动计算 marker 阈值
+    if marker_thresh is None:
+        marker_thresh = compute_marker_threshold(marker_gray)
+        print(f"    [Connected Region] Auto marker_thresh: {marker_thresh}")
+
+    # === Step 1: 从 Seg 提取前景 ===
+    posneg_mask, is_foreground, _ = compute_posneg_mask(seg_array, seg_thresh)
+
+    # === Step 2: 确定阳性像素（Seg阳性 OR Marker强阳性） ===
+    # Seg 判断的阳性: posneg_mask == 2 (即 R >= B 的前景像素)
+    seg_positive = (posneg_mask == 2)
+
+    # Marker 增强: 在前景区域中，marker值超过阈值的也视为阳性
+    marker_positive = is_foreground & (marker_gray > marker_thresh)
+
+    # 联合: 两者取并集
+    positive_pixels = (seg_positive | marker_positive).astype(np.uint8) * 255
+
+    print(f"    [Connected Region] Seg positive pixels: {np.sum(seg_positive)}, "
+          f"Marker enhanced: {np.sum(marker_positive & ~seg_positive)}, "
+          f"Total: {np.sum(positive_pixels > 0)}")
+
+    # === Step 3: 形态学闭运算 — 连接相邻阳性像素 ===
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                        (morphology_kernel, morphology_kernel))
-    binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    positive_pixels = cv2.morphologyEx(positive_pixels, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    # 3. 形态学开运算 - 去除小噪点
-    # 开运算 = 先腐蚀后膨胀，能够去除小的孤立噪点
+    # === Step 4: 形态学开运算 — 去除小噪点 ===
     kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel_open)
+    positive_pixels = cv2.morphologyEx(positive_pixels, cv2.MORPH_OPEN, kernel_open)
 
-    # 4. 连通组件分析（8-连通，考虑对角线相邻）
-    num_labels, labels = cv2.connectedComponents(binary_mask, connectivity=8)
+    # === Step 5: 连通组件分析（8-连通） ===
+    num_labels, labels = cv2.connectedComponents(positive_pixels, connectivity=8)
 
     regions_info = []
-    for region_id in range(1, num_labels):  # 0是背景，从1开始
+    for region_id in range(1, num_labels):
         region_mask = (labels == region_id)
         coords = np.argwhere(region_mask)  # (N, 2) [row, col]
 
-        # 过滤小于最小面积的区域
         if len(coords) < min_area:
             continue
 
-        # 计算区域属性
         rows, cols = coords[:, 0], coords[:, 1]
         center = (int(rows.mean()), int(cols.mean()))
         pixel_count = len(coords)
-        marker_sum = int(marker_np[region_mask].sum())
-        marker_max = int(marker_np[region_mask].max())
-        bbox = [int(rows.min()), int(rows.max()), int(cols.min()), int(cols.max())]
+        marker_values = marker_gray[region_mask]
+        marker_sum = int(marker_values.sum())
+        marker_max = int(marker_values.max())
 
         regions_info.append({
-            'id': region_id,
+            'id': len(regions_info) + 1,
             'coords': coords,
             'center': center,
             'pixel_count': pixel_count,
             'marker_sum': marker_sum,
             'marker_max': marker_max,
             'marker_mean': marker_sum / pixel_count,
-            'bbox': bbox,
-            'is_positive': True  # 从Marker提取的都是阳性区域
+            'marker_min': int(marker_values.min()),
+            'is_positive': True
         })
 
     return regions_info

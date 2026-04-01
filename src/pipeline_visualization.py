@@ -425,3 +425,215 @@ def save_pipeline_visualization(seg_array: np.ndarray,
         cells_info, base_name, marker_thresh, seg_thresh, vis_dir)
     
     return vis_dir
+
+
+# ============================================================================
+# 连通区域模式的可视化
+# ============================================================================
+
+def save_connected_region_visualization(seg_array: np.ndarray,
+                                         marker_array: np.ndarray,
+                                         regions_info: list[dict],
+                                         output_dir: str,
+                                         base_name: str,
+                                         seg_thresh: int = 120,
+                                         marker_thresh: Optional[int] = None,
+                                         morphology_kernel: int = 11,
+                                         original_image: Optional[np.ndarray] = None) -> str:
+    """
+    连通区域模式的 step-by-step 可视化。
+
+    展示 Seg+Marker 联合提取连通阳性区域的完整过程：
+        Step 1: Seg 前景提取
+        Step 2: Seg 阳性像素 (R >= B)
+        Step 3: Marker 增强阳性像素
+        Step 4: 联合阳性像素 (Seg | Marker)
+        Step 5: 形态学闭运算（连接近邻像素）
+        Step 6: 最终连通区域 + SAM2 Prompts
+        + Summary 汇总图
+    """
+    vis_dir = os.path.join(output_dir, "pipeline_visualization")
+    os.makedirs(vis_dir, exist_ok=True)
+    print(f"  > [Connected Region] Saving pipeline visualization to {vis_dir}/")
+
+    # ========== 准备数据 ==========
+    if marker_array.ndim == 3:
+        marker_gray = cv2.cvtColor(marker_array, cv2.COLOR_RGB2GRAY)
+    else:
+        marker_gray = marker_array.copy()
+
+    h, w = seg_array.shape[:2]
+
+    posneg_mask, is_foreground, rb_diff = compute_posneg_mask(seg_array, seg_thresh)
+    is_pos_pixel = (posneg_mask == 2)
+
+    if marker_thresh is None:
+        marker_thresh = compute_marker_threshold(marker_gray)
+
+    # ========== Step 1: Seg 前景 ==========
+    foreground_vis = (is_foreground * 255).astype(np.uint8)
+    cv2.imwrite(os.path.join(vis_dir, "step1_seg_foreground.png"), foreground_vis)
+
+    # ========== Step 2: Seg 阳性像素 ==========
+    seg_pos_vis = np.zeros((h, w, 3), dtype=np.uint8)
+    seg_pos_vis[is_foreground & is_pos_pixel] = [255, 0, 0]    # 红色 = 阳性
+    seg_pos_vis[is_foreground & ~is_pos_pixel] = [0, 0, 255]   # 蓝色 = 阴性
+    cv2.imwrite(os.path.join(vis_dir, "step2_seg_positive_pixels.png"),
+                cv2.cvtColor(seg_pos_vis, cv2.COLOR_RGB2BGR))
+
+    # ========== Step 3: Marker 增强 ==========
+    marker_positive = is_foreground & (marker_gray > marker_thresh)
+    marker_enhance_vis = np.zeros((h, w, 3), dtype=np.uint8)
+    marker_enhance_vis[marker_positive] = [255, 165, 0]  # 橙色 = Marker阳性
+    cv2.imwrite(os.path.join(vis_dir, "step3_marker_enhanced_pixels.png"),
+                cv2.cvtColor(marker_enhance_vis, cv2.COLOR_RGB2BGR))
+
+    # Marker 热力图
+    fig, ax = plt.subplots(figsize=(10, 10))
+    im = ax.imshow(marker_gray, cmap='hot')
+    ax.set_title(f'Marker Intensity (thresh={marker_thresh})', fontsize=12)
+    ax.axis('off')
+    plt.colorbar(im, ax=ax, shrink=0.8, label='Intensity')
+    plt.tight_layout()
+    plt.savefig(os.path.join(vis_dir, "step3_marker_heatmap.png"), dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # ========== Step 4: 联合阳性像素 ==========
+    seg_positive = (posneg_mask == 2)
+    combined_positive = seg_positive | marker_positive
+    combined_vis = np.zeros((h, w, 3), dtype=np.uint8)
+    # Seg 独有: 红色
+    seg_only = seg_positive & ~marker_positive
+    # Marker 独有: 橙色
+    marker_only = marker_positive & ~seg_positive
+    # 两者都有: 黄色
+    both = seg_positive & marker_positive
+    combined_vis[seg_only] = [255, 0, 0]
+    combined_vis[marker_only] = [255, 165, 0]
+    combined_vis[both] = [255, 255, 0]
+    cv2.imwrite(os.path.join(vis_dir, "step4_combined_positive.png"),
+                cv2.cvtColor(combined_vis, cv2.COLOR_RGB2BGR))
+
+    # ========== Step 5: 形态学闭运算 ==========
+    positive_binary = combined_positive.astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                       (morphology_kernel, morphology_kernel))
+    morphed = cv2.morphologyEx(positive_binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    morphed = cv2.morphologyEx(morphed, cv2.MORPH_OPEN, kernel_open)
+
+    # 对比：闭运算前 vs 后
+    morph_compare = np.zeros((h, w, 3), dtype=np.uint8)
+    morph_compare[positive_binary > 0] = [100, 100, 100]   # 灰色 = 原始
+    morph_compare[morphed > 0] = [0, 255, 0]               # 绿色 = 闭运算后
+    # 闭运算新增的部分标为亮绿
+    newly_connected = (morphed > 0) & (positive_binary == 0)
+    morph_compare[newly_connected] = [0, 255, 128]          # 亮绿 = 新连接的像素
+    cv2.imwrite(os.path.join(vis_dir, "step5_morphology_result.png"),
+                cv2.cvtColor(morph_compare, cv2.COLOR_RGB2BGR))
+
+    # 单独保存闭运算后的二值图
+    cv2.imwrite(os.path.join(vis_dir, "step5_morphed_binary.png"), morphed)
+
+    # ========== Step 6: 最终连通区域 ==========
+    np.random.seed(42)
+    num_regions = len(regions_info)
+    region_colors = np.random.randint(80, 255, size=(num_regions + 1, 3), dtype=np.uint8)
+
+    regions_vis = np.zeros((h, w, 3), dtype=np.uint8)
+    for idx, region in enumerate(regions_info):
+        coords = region['coords']
+        color = tuple(int(c) for c in region_colors[idx])
+        regions_vis[coords[:, 0], coords[:, 1]] = color
+    cv2.imwrite(os.path.join(vis_dir, "step6_connected_regions.png"),
+                cv2.cvtColor(regions_vis, cv2.COLOR_RGB2BGR))
+
+    # 叠加到原图
+    if original_image is not None:
+        overlay = original_image.copy()
+        mask_any = np.any(regions_vis > 0, axis=2)
+        overlay[mask_any] = (overlay[mask_any].astype(np.float32) * 0.5 +
+                             regions_vis[mask_any].astype(np.float32) * 0.5).astype(np.uint8)
+        cv2.imwrite(os.path.join(vis_dir, "step6_regions_overlay.png"),
+                    cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+
+    # SAM2 Prompts（全分辨率）
+    prompts_fullres = np.zeros((h, w), dtype=np.uint8)
+    for region in regions_info:
+        coords = region['coords']
+        prompts_fullres[coords[:, 0], coords[:, 1]] = 255
+    cv2.imwrite(os.path.join(vis_dir, "step6_sam2_prompts_fullres.png"), prompts_fullres)
+
+    # 每个区域单独的 prompt
+    for region in regions_info:
+        rid = region['id']
+        coords = region['coords']
+        region_mask = np.zeros((h, w), dtype=np.uint8)
+        region_mask[coords[:, 0], coords[:, 1]] = 255
+        region_mask_256 = cv2.resize(region_mask, (256, 256), interpolation=cv2.INTER_NEAREST)
+        cv2.imwrite(os.path.join(vis_dir, f"step6_prompt_region_{rid}.png"), region_mask_256)
+    print(f"    Saved {num_regions} region prompts")
+
+    # ========== Summary 汇总图 ==========
+    fig, axes = plt.subplots(2, 4, figsize=(24, 12))
+
+    # Row 1: 提取过程
+    axes[0, 0].imshow(seg_array)
+    axes[0, 0].set_title('1. Seg Output', fontsize=11)
+    axes[0, 0].axis('off')
+
+    axes[0, 1].imshow(foreground_vis, cmap='gray')
+    axes[0, 1].set_title(f'2. Foreground (thresh={seg_thresh})', fontsize=11)
+    axes[0, 1].axis('off')
+
+    axes[0, 2].imshow(seg_pos_vis)
+    axes[0, 2].set_title(f'3. Seg Positive (R>=B)', fontsize=11)
+    axes[0, 2].axis('off')
+
+    axes[0, 3].imshow(marker_gray, cmap='hot')
+    axes[0, 3].set_title(f'4. Marker (thresh={marker_thresh})', fontsize=11)
+    axes[0, 3].axis('off')
+
+    # Row 2: 连接过程
+    axes[1, 0].imshow(combined_vis)
+    axes[1, 0].set_title(f'5. Combined (Seg|Marker)\n'
+                         f'Red=Seg, Orange=Marker, Yellow=Both', fontsize=10)
+    axes[1, 0].axis('off')
+
+    axes[1, 1].imshow(morph_compare)
+    axes[1, 1].set_title(f'6. Morphology Close (k={morphology_kernel})\n'
+                         f'Gray=Before, Green=After', fontsize=10)
+    axes[1, 1].axis('off')
+
+    axes[1, 2].imshow(regions_vis)
+    axes[1, 2].set_title(f'7. Connected Regions ({num_regions})', fontsize=11)
+    axes[1, 2].axis('off')
+
+    if original_image is not None:
+        axes[1, 3].imshow(overlay)
+    else:
+        axes[1, 3].imshow(prompts_fullres, cmap='gray')
+    axes[1, 3].set_title('8. Overlay / SAM2 Prompts', fontsize=11)
+    axes[1, 3].axis('off')
+
+    # 区域统计
+    total_pixels = sum(r['pixel_count'] for r in regions_info)
+    plt.suptitle(f'{base_name} - Connected Region Pipeline\n'
+                 f'seg_thresh={seg_thresh}, marker_thresh={marker_thresh}, '
+                 f'kernel={morphology_kernel}, regions={num_regions}, '
+                 f'total_px={total_pixels}', fontsize=13)
+    plt.tight_layout()
+    plt.savefig(os.path.join(vis_dir, "pipeline_summary.png"), dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # ========== CSV ==========
+    csv_path = os.path.join(vis_dir, "regions_detail.csv")
+    with open(csv_path, 'w') as f:
+        f.write("region_id,pixel_count,marker_mean,marker_max,marker_min,center_y,center_x\n")
+        for r in regions_info:
+            cy, cx = r['center']
+            f.write(f"{r['id']},{r['pixel_count']},{r['marker_mean']:.1f},"
+                    f"{r['marker_max']},{r.get('marker_min', 0)},{cy},{cx}\n")
+    print(f"    Saved region details CSV: {csv_path}")
+
+    return vis_dir

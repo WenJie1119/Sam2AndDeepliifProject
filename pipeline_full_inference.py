@@ -219,32 +219,41 @@ def main():
                         seg_thresh=args.seg_thresh,
                         marker_thresh=args.marker_thresh
                     )
-                
-                # 可视化细胞提取过程 (如果启用)
+
+                # 可视化细胞提取过程 (如果启用) — 仅限原有细胞模式
                 if hasattr(args, 'save_cell_extraction_vis') and args.save_cell_extraction_vis:
-                    from src.cell_extraction import visualize_cell_extraction
-                    vis_dir = os.path.join(args.output_dir, "cell_extraction_vis")
-                    os.makedirs(vis_dir, exist_ok=True)
-                    vis_path = os.path.join(vis_dir, f"{base_name}_cell_extraction.png")
-                    print(f"  > Saving cell extraction visualization...")
-                    visualize_cell_extraction(
-                        seg_np, marker_np, all_cells_info,
-                        output_path=vis_path,
-                        seg_thresh=args.seg_thresh,
-                        show_labels=True
-                    )
-                
-                # 详细的 pipeline 可视化 (如果启用) - 注意：需要先计算 filtered cells
-                # 这里先标记需要可视化，等 filter_positive_cells 执行后再保存
+                    if not (hasattr(args, 'use_connected_regions') and args.use_connected_regions):
+                        from src.cell_extraction import visualize_cell_extraction
+                        vis_dir = os.path.join(args.output_dir, "cell_extraction_vis")
+                        os.makedirs(vis_dir, exist_ok=True)
+                        vis_path = os.path.join(vis_dir, f"{base_name}_cell_extraction.png")
+                        print(f"  > Saving cell extraction visualization...")
+                        visualize_cell_extraction(
+                            seg_np, marker_np, all_cells_info,
+                            output_path=vis_path,
+                            seg_thresh=args.seg_thresh,
+                            show_labels=True
+                        )
+
+                # 过滤阳性细胞 + pipeline 可视化
                 save_pipeline_vis_later = hasattr(args, 'save_pipeline_vis') and args.save_pipeline_vis
 
-                # 过滤阳性细胞
-                # 连通区域模式：跳过二次过滤（Marker提取的都是阳性）
-                # 细胞模式：使用动态阈值筛选
                 if hasattr(args, 'use_connected_regions') and args.use_connected_regions:
                     # 连通区域模式：不需要二次过滤
                     positive_cells_info = all_cells_info
                     print(f"    [Connected Region Mode] All {len(positive_cells_info)} regions are positive (no filtering)")
+
+                    # 连通区域模式的 pipeline 可视化
+                    if save_pipeline_vis_later:
+                        from src.pipeline_visualization import save_connected_region_visualization
+                        save_connected_region_visualization(
+                            seg_np, marker_np, positive_cells_info,
+                            args.output_dir, base_name,
+                            seg_thresh=args.seg_thresh,
+                            marker_thresh=args.marker_thresh,
+                            morphology_kernel=args.morphology_kernel,
+                            original_image=original_np
+                        )
                 else:
                     # 原有的细胞过滤逻辑
                     filter_params = {
@@ -258,22 +267,19 @@ def main():
                         marker_max_thresh=filter_params['marker_max_thresh'],
                         min_pixel_count=filter_params['min_pixel_count']
                     )
-                # 直接使用 is_positive 标志（由动态 marker_thresh 决定）
-                # positive_cells_info = [c for c in all_cells_info if c.get('is_positive', False)]
-                # print(f"    After dynamic marker filtering (is_positive=True): {len(positive_cells_info)} cells")
-                
-                # 保存 pipeline 可视化 (在 filter_positive_cells 之后，包含 Step 6)
-                if save_pipeline_vis_later:
-                    from src.pipeline_visualization import save_pipeline_visualization
-                    save_pipeline_visualization(
-                        seg_np, marker_np, all_cells_info,
-                        args.output_dir, base_name,
-                        seg_thresh=args.seg_thresh,
-                        marker_thresh=args.marker_thresh,
-                        original_image=original_np,
-                        filtered_cells_info=positive_cells_info,
-                        filter_params=filter_params
-                    )
+
+                    # 原有模式的 pipeline 可视化
+                    if save_pipeline_vis_later:
+                        from src.pipeline_visualization import save_pipeline_visualization
+                        save_pipeline_visualization(
+                            seg_np, marker_np, all_cells_info,
+                            args.output_dir, base_name,
+                            seg_thresh=args.seg_thresh,
+                            marker_thresh=args.marker_thresh,
+                            original_image=original_np,
+                            filtered_cells_info=positive_cells_info,
+                            filter_params=filter_params
+                        )
                 
                 num_positive = len(positive_cells_info)
                 num_negative = len(all_cells_info) - num_positive

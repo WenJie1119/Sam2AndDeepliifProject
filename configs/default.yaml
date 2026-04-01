@@ -1,0 +1,58 @@
+# CD34 Microvessel Detection Pipeline — Default Configuration
+# 覆盖方式: 直接修改此文件，或复制到 configs/experiments/ 下自定义
+
+# ===== DeepLIIF 参数 =====
+deepliif:
+  model_dir: data/models/deepliif/
+  tile_size: 512
+  resolution: "40x"            # 10x / 20x / 40x
+  seg_weights: null             # [w1, w2, w3, w4, w5] 或 null(等权)
+  enable_postprocessing: false
+  color_dapi: false
+  color_marker: false
+
+# ===== DeepLIIF 后处理参数 =====
+deepliif_postprocessing:
+  seg_thresh: 120
+  size_thresh: "default"        # "default" 或整数
+  size_thresh_upper: null       # null 表示不限
+  marker_thresh: null           # null 表示自动计算
+  noise_thresh: 4
+  large_noise_thresh: "default" # "default" / "none" / 整数
+
+# ===== SAM2 参数 =====
+sam2:
+  checkpoint: data/models/sam2/sam2.1_hiera_large.pt
+  config: configs/sam2.1/sam2.1_hiera_l.yaml
+  min_mask_area: 50
+
+# ===== SAM2 模式控制 =====
+sam2_mode:
+  skip_mask_only: false
+  group_cells: false
+  group_distance: 50.0
+  use_connected_regions: false
+  morphology_kernel: 11
+
+# ===== 输入输出 =====
+io:
+  input_dir: null               # 必填
+  output_dir: null              # 必填
+  device: "cuda"
+  resume: false
+
+# ===== 输出控制 =====
+output:
+  save_deepliif_outputs: false
+  save_combined: false
+  save_comparison: false
+  save_sam_outputs: false
+  save_csv: false
+  save_npy: false
+  save_seg_npy: false
+  save_sam_steps: false
+  save_original_sam_comparison: false
+  save_cell_extraction_vis: false
+  save_pipeline_vis: false
+  export_labelme: true
+  labelme_include_imagedata: false

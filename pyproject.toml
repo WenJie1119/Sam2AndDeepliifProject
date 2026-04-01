@@ -1,6 +1,41 @@
 [build-system]
-requires = [
-    "setuptools>=61.0",  
-    "torch>=2.5.1",
-    ]
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "cd34-microvessel-detection"
+version = "1.0.0"
+description = "CD34 microvessel detection pipeline using DeepLIIF + SAM2"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+    "SAM-2 @ git+https://github.com/facebookresearch/sam2.git",
+    "torch>=2.3.1",
+    "torchvision>=0.18.1",
+    "numpy>=1.24",
+    "opencv-python>=4.7",
+    "Pillow>=9.4",
+    "hydra-core>=1.3",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+tile = [
+    "scipy>=1.10",
+    "pandas>=2.0",
+]
+cluster = [
+    "scikit-learn>=1.2",
+]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+cd34-pipeline = "scripts.run_pipeline:main"
+
+[tool.setuptools.packages.find]
+include = ["cd34_pipeline*", "scripts"]

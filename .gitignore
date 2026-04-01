@@ -1,22 +1,40 @@
-.vscode/
-.DS_Store
+# Python
 __pycache__/
-*-checkpoint.ipynb
-.venv
-*.egg*
-build/*
-_C.*
-outputs/*
-checkpoints/*.pt
-demo/backend/checkpoints/*.pt
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
 
-# --- Custom Ignores ---
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
 # Model weights
-*.pth
-*.pt
-*.onnx
+data/models/**/*.pt
+data/models/**/*.pth
+data/models/**/*.onnx
 
-# Images
+# Legacy model directories (if not yet moved to data/models/)
+checkpoints/*.pt
+deepliif_models/*.pt
+
+# Data & output
+data/input/
+data/output/
+test_results/
+
+# Images (typically large, not tracked)
 *.jpg
 *.jpeg
 *.png
@@ -24,9 +42,9 @@ demo/backend/checkpoints/*.pt
 *.tiff
 *.svs
 
-# Data and Artifacts
-# checkpoints/ -> handled by local .gitignore
-# deepliif_models/ -> handled by local .gitignore
-# test_results/ -> handled by local .gitignore
-__pycache__/
-*.pyc
+# Jupyter
+*-checkpoint.ipynb
+
+# Misc
+outputs/*
+_C.*

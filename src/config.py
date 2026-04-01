@@ -128,7 +128,21 @@ def parse_arguments() -> argparse.Namespace:
     group_sam_mode.add_argument('--group-distance', type=float, default=50.0,
         help='Distance threshold (pixels) for grouping cells. Cells with center distance < this value '
              'will be grouped together. Only used when --group-cells is enabled. (default: 50.0)')
-    
+
+    # 方案1: 连通区域提取模式参数
+    group_region_mode = parser.add_argument_group('Connected Region Extraction Mode (Solution 1)',
+        description='Extract connected brown regions directly from Marker instead of individual cells. '
+                    'This preserves connectivity of continuous brown staining areas.')
+    group_region_mode.add_argument('--use-connected-regions', action='store_true',
+        help='Enable connected region extraction mode: Extract continuous brown regions from Marker '
+             'instead of individual cells from Seg. This keeps connected brown areas as single regions.')
+    group_region_mode.add_argument('--marker-region-thresh', type=int, default=30,
+        help='Threshold for Marker binarization (0-255). Lower values capture lighter brown regions. '
+             'Recommended: 20-40. (default: 30)')
+    group_region_mode.add_argument('--morphology-kernel', type=int, default=11,
+        help='Morphology kernel size for connecting nearby brown pixels. Larger values connect more distant regions. '
+             'Recommended: 7-15. (default: 11)')
+
     return parser.parse_args()
 
 

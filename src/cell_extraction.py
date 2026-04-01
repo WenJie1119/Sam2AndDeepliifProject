@@ -625,5 +625,103 @@ def visualize_cell_extraction(seg_array: np.ndarray,
     
     if show_plot:
         plt.show()
-    
-    plt.close(fig)  # Close the figure to free memory
+
+
+# ============================================================================
+# 方案1: 直接从Marker提取连通的棕色区域（而非单个细胞）
+# ============================================================================
+
+def extract_brown_regions_from_marker(marker_np: np.ndarray,
+                                      threshold: int = 30,
+                                      morphology_kernel: int = 11,
+                                      min_area: int = 200) -> list:
+    """
+    直接从Marker图像提取连通的棕色区域（而非单个细胞）
+
+    这个方法跳过细胞级分割，直接识别连续的棕色染色区域，
+    保持区域的连通性，避免将整块染色区域拆分成多个细胞。
+
+    核心步骤：
+    1. 对Marker灰度图进行二值化（低阈值，捕获浅色棕色区域）
+    2. 形态学闭运算（关键！连接相邻的棕色像素形成整体）
+    3. 形态学开运算（去除小噪点）
+    4. 连通组件分析（提取每个连通区域）
+
+    Args:
+        marker_np: Marker灰度图 (H, W)，像素值越高表示棕色染色越强
+        threshold: 二值化阈值，越低越敏感，捕获更多浅色区域
+                  推荐值: 20-40 (默认30)
+        morphology_kernel: 形态学闭运算核大小，越大连接性越强
+                          推荐值: 7-15 (默认11)
+        min_area: 最小区域面积（像素数），过滤小碎片
+                 推荐值: 100-500 (默认200)
+
+    Returns:
+        regions_info: 列表，每个元素是一个字典，包含：
+            - 'id': 区域ID (从1开始)
+            - 'coords': 区域坐标 (N, 2) [row, col]
+            - 'center': 中心坐标 (row, col)
+            - 'pixel_count': 像素数量
+            - 'marker_sum': marker值总和
+            - 'marker_max': marker最大值
+            - 'marker_mean': marker平均值
+            - 'bbox': 边界框 [y_min, y_max, x_min, x_max]
+            - 'is_positive': 布尔值，True（从Marker提取的都是阳性）
+
+    使用示例：
+        marker = np.array(deepliif_results['Marker'].convert('L'))
+        regions = extract_brown_regions_from_marker(
+            marker,
+            threshold=30,
+            morphology_kernel=11,
+            min_area=200
+        )
+        print(f"Found {len(regions)} connected brown regions")
+    """
+    # 1. 二值化 - 将Marker转换为二值图
+    _, binary_mask = cv2.threshold(marker_np, threshold, 255, cv2.THRESH_BINARY)
+
+    # 2. 形态学闭运算 - 关键步骤！连接近邻的棕色像素
+    # 闭运算 = 先膨胀后腐蚀，能够填充小空洞，连接断开的区域
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                       (morphology_kernel, morphology_kernel))
+    binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    # 3. 形态学开运算 - 去除小噪点
+    # 开运算 = 先腐蚀后膨胀，能够去除小的孤立噪点
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel_open)
+
+    # 4. 连通组件分析（8-连通，考虑对角线相邻）
+    num_labels, labels = cv2.connectedComponents(binary_mask, connectivity=8)
+
+    regions_info = []
+    for region_id in range(1, num_labels):  # 0是背景，从1开始
+        region_mask = (labels == region_id)
+        coords = np.argwhere(region_mask)  # (N, 2) [row, col]
+
+        # 过滤小于最小面积的区域
+        if len(coords) < min_area:
+            continue
+
+        # 计算区域属性
+        rows, cols = coords[:, 0], coords[:, 1]
+        center = (int(rows.mean()), int(cols.mean()))
+        pixel_count = len(coords)
+        marker_sum = int(marker_np[region_mask].sum())
+        marker_max = int(marker_np[region_mask].max())
+        bbox = [int(rows.min()), int(rows.max()), int(cols.min()), int(cols.max())]
+
+        regions_info.append({
+            'id': region_id,
+            'coords': coords,
+            'center': center,
+            'pixel_count': pixel_count,
+            'marker_sum': marker_sum,
+            'marker_max': marker_max,
+            'marker_mean': marker_sum / pixel_count,
+            'bbox': bbox,
+            'is_positive': True  # 从Marker提取的都是阳性区域
+        })
+
+    return regions_info

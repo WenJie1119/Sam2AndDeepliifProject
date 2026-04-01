@@ -183,17 +183,50 @@ def main():
             seg_img = deepliif_results.get('Seg')
             marker_img = deepliif_results.get('Marker')
             seg_np = np.array(seg_img)
-            
+
             if marker_img is not None:
                 marker_np = np.array(marker_img)
-                print(f"  > Extracting cells from raw Seg with Marker classification...")
-                
-                all_cells_info = extract_cells_from_seg(
-                    seg_np, marker_np, 
-                    min_area=args.min_mask_area,
-                    seg_thresh=args.seg_thresh,
-                    marker_thresh=args.marker_thresh
-                )
+
+                # ===== 方案1: 使用连通区域提取模式 =====
+                if hasattr(args, 'use_connected_regions') and args.use_connected_regions:
+                    print(f"  > [Connected Region Mode] Extracting connected brown regions from Marker...")
+                    from src.cell_extraction import extract_brown_regions_from_marker
+
+                    # 将Marker转换为灰度图
+                    if marker_np.ndim == 3:
+                        marker_gray = cv2.cvtColor(marker_np, cv2.COLOR_RGB2GRAY)
+                    else:
+                        marker_gray = marker_np
+
+                    positive_cells_info = extract_brown_regions_from_marker(
+                        marker_gray,
+                        threshold=args.marker_region_thresh,
+                        morphology_kernel=args.morphology_kernel,
+                        min_area=args.min_mask_area
+                    )
+
+                    print(f"    Found {len(positive_cells_info)} connected brown regions")
+                    print(f"    Parameters: threshold={args.marker_region_thresh}, kernel={args.morphology_kernel}, min_area={args.min_mask_area}")
+
+                    # 显示区域统计
+                    if positive_cells_info:
+                        areas = [c['pixel_count'] for c in positive_cells_info]
+                        markers = [c['marker_mean'] for c in positive_cells_info]
+                        print(f"    Region sizes: min={min(areas)}, max={max(areas)}, mean={np.mean(areas):.0f} pixels")
+                        print(f"    Marker intensity: min={min(markers):.1f}, max={max(markers):.1f}, mean={np.mean(markers):.1f}")
+
+                    all_cells_info = positive_cells_info  # 兼容后续代码
+
+                # ===== 原有模式: 从Seg提取单个细胞 =====
+                else:
+                    print(f"  > [Cell Mode] Extracting cells from raw Seg with Marker classification...")
+
+                    all_cells_info = extract_cells_from_seg(
+                        seg_np, marker_np,
+                        min_area=args.min_mask_area,
+                        seg_thresh=args.seg_thresh,
+                        marker_thresh=args.marker_thresh
+                    )
                 
                 # 可视化细胞提取过程 (如果启用)
                 if hasattr(args, 'save_cell_extraction_vis') and args.save_cell_extraction_vis:
@@ -212,19 +245,27 @@ def main():
                 # 详细的 pipeline 可视化 (如果启用) - 注意：需要先计算 filtered cells
                 # 这里先标记需要可视化，等 filter_positive_cells 执行后再保存
                 save_pipeline_vis_later = hasattr(args, 'save_pipeline_vis') and args.save_pipeline_vis
-                # 过滤阳性细胞 - 使用与 DeepLIIF 一致的动态阈值筛选
-                # [已注释] 原第二层筛选：
-                filter_params = {
-                    'marker_sum_thresh': 1000,
-                    'marker_max_thresh': 30,
-                    'min_pixel_count': 100
-                }
-                positive_cells_info = filter_positive_cells(
-                    all_cells_info, 
-                    marker_sum_thresh=filter_params['marker_sum_thresh'], 
-                    marker_max_thresh=filter_params['marker_max_thresh'], 
-                    min_pixel_count=filter_params['min_pixel_count']
-                )
+
+                # 过滤阳性细胞
+                # 连通区域模式：跳过二次过滤（Marker提取的都是阳性）
+                # 细胞模式：使用动态阈值筛选
+                if hasattr(args, 'use_connected_regions') and args.use_connected_regions:
+                    # 连通区域模式：不需要二次过滤
+                    positive_cells_info = all_cells_info
+                    print(f"    [Connected Region Mode] All {len(positive_cells_info)} regions are positive (no filtering)")
+                else:
+                    # 原有的细胞过滤逻辑
+                    filter_params = {
+                        'marker_sum_thresh': 1000,
+                        'marker_max_thresh': 30,
+                        'min_pixel_count': 100
+                    }
+                    positive_cells_info = filter_positive_cells(
+                        all_cells_info,
+                        marker_sum_thresh=filter_params['marker_sum_thresh'],
+                        marker_max_thresh=filter_params['marker_max_thresh'],
+                        min_pixel_count=filter_params['min_pixel_count']
+                    )
                 # 直接使用 is_positive 标志（由动态 marker_thresh 决定）
                 # positive_cells_info = [c for c in all_cells_info if c.get('is_positive', False)]
                 # print(f"    After dynamic marker filtering (is_positive=True): {len(positive_cells_info)} cells")

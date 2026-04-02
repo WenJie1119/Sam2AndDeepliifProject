@@ -13,6 +13,7 @@ import os
 import csv
 import json
 import base64
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -469,3 +470,244 @@ def save_seg_probability_npy(seg_image, output_path: str,
     
     print(f"    Saved Seg probability npy: {output_path} (shape={seg_array.shape})")
     return output_path
+
+
+def prepare_resume_skip_set(output_dir: str, resume: bool) -> set:
+    """
+    断点续传：扫描已完成的 labelme JSON，返回需要跳过的图像名集合。
+    最后一个 JSON 会被删除（可能不完整），其余加入跳过集合。
+    """
+    skip_set = set()
+    if not resume:
+        return skip_set
+
+    labelme_dir = os.path.join(output_dir, "labelme")
+    if not os.path.exists(labelme_dir):
+        print(f"\n[RESUME] Output directory not found. Starting from beginning.")
+        return skip_set
+
+    existing_jsons = []
+    for f in os.listdir(labelme_dir):
+        if f.endswith('.json'):
+            json_path = os.path.join(labelme_dir, f)
+            mtime = os.path.getmtime(json_path)
+            base = os.path.splitext(f)[0]
+            existing_jsons.append((base, json_path, mtime))
+
+    if not existing_jsons:
+        print(f"\n[RESUME] No existing JSON files found. Starting from beginning.")
+        return skip_set
+
+    existing_jsons.sort(key=lambda x: x[2], reverse=True)
+    latest_base, latest_path, _ = existing_jsons[0]
+
+    os.remove(latest_path)
+    print(f"\n[RESUME] Deleted last JSON (may be incomplete): {latest_path}")
+
+    for base, path, _ in existing_jsons[1:]:
+        skip_set.add(base)
+
+    print(f"[RESUME] Will skip {len(skip_set)} already processed images.")
+    print(f"[RESUME] Will re-process from: {latest_base}")
+    return skip_set
+
+
+def handle_no_positive_cells(img_path: str, img_name: str, output_dir: str, base_name: str):
+    """
+    无阳性细胞时：将原图及相关中间文件移到 no_positive_cells 目录。
+    """
+    no_positive_dir = os.path.join(output_dir, "no_positive_cells")
+    os.makedirs(no_positive_dir, exist_ok=True)
+
+    # 移动原始图像
+    if os.path.exists(img_path):
+        dest_path = os.path.join(no_positive_dir, img_name)
+        shutil.move(img_path, dest_path)
+        print(f"    Moved image with no positive cells to: {dest_path}")
+
+    # 移动 background 图像 (如果存在)
+    bg_file = os.path.join(output_dir, "background", f"{base_name}.png")
+    if os.path.exists(bg_file):
+        dest_bg = os.path.join(no_positive_dir, f"{base_name}_background.png")
+        shutil.move(bg_file, dest_bg)
+        print(f"    Moved background file to: {dest_bg}")
+
+    # 移动 labelme 文件 (如果存在)
+    labelme_dir = os.path.join(output_dir, "labelme")
+    if os.path.exists(labelme_dir):
+        for ext, suffix in [('.json', '.json'), ('.png', '_labelme.png')]:
+            src = os.path.join(labelme_dir, f"{base_name}{ext}")
+            if os.path.exists(src):
+                dest = os.path.join(no_positive_dir, f"{base_name}{suffix}")
+                shutil.move(src, dest)
+                print(f"    Moved {src} to: {dest}")
+
+
+def save_cell_groups_csv(cell_groups: list, output_dir: str, base_name: str,
+                         distance_threshold: float) -> str:
+    """
+    保存细胞分组信息 CSV（组ID、成员、距离等）。
+    """
+    group_csv_dir = os.path.join(output_dir, "cell_groups")
+    os.makedirs(group_csv_dir, exist_ok=True)
+    group_csv_path = os.path.join(group_csv_dir, f"{base_name}_cell_groups.csv")
+
+    with open(group_csv_path, 'w') as f:
+        f.write("group_id,num_cells,member_ids,total_pixels,center_y,center_x,distance_threshold,member_distances\n")
+        for group in cell_groups:
+            member_ids_str = ';'.join(map(str, group['member_ids']))
+            center_y, center_x = group['center']
+
+            member_distances = []
+            member_cells = group['member_cells']
+            for i in range(len(member_cells)):
+                for j in range(i + 1, len(member_cells)):
+                    c1 = member_cells[i]['center']
+                    c2 = member_cells[j]['center']
+                    dist = np.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)
+                    member_distances.append(f"{member_cells[i]['id']}-{member_cells[j]['id']}:{dist:.1f}")
+
+            distances_str = ';'.join(member_distances) if member_distances else 'single_cell'
+            f.write(f"{group['group_id']},{len(group['member_ids'])},\"{member_ids_str}\",{group['total_pixels']},{center_y},{center_x},{distance_threshold},\"{distances_str}\"\n")
+
+    print(f"    Saved grouping info to: {group_csv_path}")
+    return group_csv_path
+
+
+def save_merged_regions_csv(sam_mask_merged: np.ndarray, scores_merged: list,
+                            output_dir: str, base_name: str):
+    """
+    保存合并区域统计 CSV（区域ID、像素数、分数）。
+    """
+    if sam_mask_merged is None or np.max(sam_mask_merged) == 0:
+        return
+
+    merged_regions_csv_path = os.path.join(output_dir, "merged_regions", f"{base_name}_merged_regions.csv")
+    os.makedirs(os.path.dirname(merged_regions_csv_path), exist_ok=True)
+
+    unique_ids = np.unique(sam_mask_merged)
+    unique_ids = unique_ids[unique_ids > 0]
+
+    with open(merged_regions_csv_path, 'w') as f:
+        f.write("region_id,pixel_count,avg_score,member_instances\n")
+        for region_id in sorted(unique_ids):
+            pixel_count = int(np.sum(sam_mask_merged == region_id))
+            score_info = next((s for s in scores_merged if s[0] == region_id), None)
+            if score_info:
+                avg_score = score_info[1]
+                member_ids = score_info[2] if len(score_info) > 2 else []
+            else:
+                avg_score = 0.0
+                member_ids = []
+            f.write(f"{region_id},{pixel_count},{avg_score:.4f},\"{member_ids}\"\n")
+
+    print(f"  > Saved merged regions CSV: {merged_regions_csv_path}")
+    print(f"    Total {len(unique_ids)} regions")
+
+
+def export_and_handle_labelme(output_dir: str, base_name: str, sam_mask_merged: np.ndarray,
+                              original_np: np.ndarray, merged_cells_info: list,
+                              img_path: str, img_name: str, args) -> int:
+    """
+    导出 LabelMe 标注并处理结果：成功则移动原图到 labelme/，失败则移到 sam2_failed/。
+    返回 shape 数量。
+    """
+    print("  > Exporting to LabelMe format...")
+    json_path, num_shapes = export_labelme_annotation(
+        output_dir=output_dir,
+        base_name=base_name,
+        instance_mask=sam_mask_merged,
+        original_image_array=original_np,
+        cells_info=merged_cells_info,
+        include_image_data=args.labelme_include_imagedata,
+        original_image_path=img_path
+    )
+
+    if num_shapes == 0:
+        # SAM2 分割失败：删除空 JSON，移原图到 sam2_failed/
+        print("    WARNING: SAM2 produced no valid segmentations!")
+        sam2_failed_dir = os.path.join(output_dir, "sam2_failed")
+        os.makedirs(sam2_failed_dir, exist_ok=True)
+
+        if os.path.exists(json_path):
+            os.remove(json_path)
+            print(f"    Deleted empty JSON: {json_path}")
+
+        if os.path.exists(img_path):
+            shutil.move(img_path, os.path.join(sam2_failed_dir, img_name))
+            print(f"    Moved original image to: {sam2_failed_dir}/{img_name}")
+
+        labelme_img = os.path.join(output_dir, "labelme", f"{base_name}.png")
+        if os.path.exists(labelme_img):
+            os.remove(labelme_img)
+            print(f"    Removed duplicate from labelme/")
+    else:
+        # 成功：移动原图到 labelme/
+        labelme_dir = os.path.join(output_dir, "labelme")
+        if os.path.exists(img_path):
+            dest_img = os.path.join(labelme_dir, img_name)
+            shutil.move(img_path, dest_img)
+            print(f"    Moved original image to: {dest_img}")
+        print(f"    Use command: labelme {output_dir}/labelme/{base_name}.json")
+
+    return num_shapes
+
+
+def save_sam2_outputs(sam_out_dir: str, original_np: np.ndarray,
+                      positive_cells_info: list,
+                      sam_mask_only: np.ndarray, sam_mask_only_merged: np.ndarray,
+                      filtered_mask_only: list):
+    """保存 SAM2 Mask-Only 输出结果（掩码可视化和 prompt 信息）。"""
+    from cd34_pipeline.cell.mask_utils import generate_mask_from_cluster, generate_distinct_colors
+
+    # 保存 mask prompts
+    mask_prompt_dir = os.path.join(sam_out_dir, "mask_prompts")
+    os.makedirs(mask_prompt_dir, exist_ok=True)
+
+    if positive_cells_info and len(positive_cells_info) > 0:
+        h, w = original_np.shape[:2]
+        colors = generate_distinct_colors(len(positive_cells_info))
+
+        # Combined visualization
+        combined_mask_viz = np.zeros((h, w, 3), dtype=np.uint8)
+        for idx, cell in enumerate(positive_cells_info):
+            coords = cell['coords']
+            color = colors[idx] if idx < len(colors) else (255, 0, 0)
+            combined_mask_viz[coords[:, 0], coords[:, 1]] = color
+
+            center_y, center_x = cell['center']
+            cv2.putText(combined_mask_viz, str(idx + 1), (center_x - 8, center_y + 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            cv2.putText(combined_mask_viz, str(idx + 1), (center_x - 8, center_y + 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
+        cv2.imwrite(f"{mask_prompt_dir}/mask_prompts_combined.png",
+                   cv2.cvtColor(combined_mask_viz, cv2.COLOR_RGB2BGR))
+
+        # Low-res version
+        low_res_combined = np.zeros((256, 256), dtype=np.float32)
+        for idx, cell in enumerate(positive_cells_info):
+            mask_input = generate_mask_from_cluster(cell['coords'], original_np.shape)
+            low_res_combined = np.maximum(low_res_combined, mask_input[0])
+
+        low_res_viz = ((low_res_combined + 10) / 20 * 255).clip(0, 255).astype(np.uint8)
+        cv2.imwrite(f"{mask_prompt_dir}/mask_prompts_256x256.png", low_res_viz)
+
+        print(f"  > Saved mask prompts to {mask_prompt_dir}/")
+
+    # 保存 mask-only 结果
+    filtered_ids = set(inst_id for inst_id, _ in filtered_mask_only)
+
+    save_sam2_mask_visualization(
+        sam_mask_only,
+        f"{sam_out_dir}/sam_mask_only.png",
+        positive_cells_info,
+        filtered_ids
+    )
+
+    save_sam2_mask_visualization(
+        sam_mask_only_merged,
+        f"{sam_out_dir}/sam_mask_only_merged.png",
+        positive_cells_info,
+        set()
+    )

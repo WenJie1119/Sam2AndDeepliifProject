@@ -102,9 +102,9 @@ class DeepLIIFInference:
             # 4. Aggregate Segmentation
             if seg_results_ts:
                 if seg_weights is None:
-                    # Use original DeepLIIF default weights instead of equal weights
+                    # Equal weights matching upstream DeepLIIF default: 1/(modalities+1) = 0.2
                     # [G51=IHC, G52=Hema, G53=DAPI, G54=Lap2, G55=Marker]
-                    weights = [0.25, 0.15, 0.25, 0.1, 0.25]
+                    weights = [0.2, 0.2, 0.2, 0.2, 0.2]
                 else:
                     weights = seg_weights
                 

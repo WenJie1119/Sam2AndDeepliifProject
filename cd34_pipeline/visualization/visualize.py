@@ -529,3 +529,101 @@ def save_original_sam_comparison(output_dir: str, base_name: str,
     cv2.imwrite(save_path, comparison)
     
     return save_path
+
+
+def save_pipeline_comparison(output_dir: str, base_name: str, original_np: np.ndarray,
+                             deepliif_results: dict, mask_np: np.ndarray,
+                             sam_mask_only_merged: np.ndarray, sam_mask_only: np.ndarray,
+                             clusters: list, scores_mask_only: list,
+                             positive_cells_info: list, filtered_mask_only: list,
+                             marker_np, args):
+    """
+    构建参数并生成 DeepLIIF + SAM2 全流程对比图。
+    """
+    seg_np = np.array(deepliif_results.get('Seg'))
+    seg_overlaid_np = np.array(deepliif_results.get('SegOverlaid')) if deepliif_results.get('SegOverlaid') else None
+    seg_refined_np = np.array(deepliif_results.get('SegRefined')) if deepliif_results.get('SegRefined') else None
+
+    from cd34_pipeline.config import parse_size_thresh, parse_large_noise_thresh
+    size_thresh = parse_size_thresh(args.size_thresh)
+    large_noise_thresh = parse_large_noise_thresh(args.large_noise_thresh)
+
+    deepliif_params = {
+        'seg_thresh': args.seg_thresh,
+        'size_thresh': size_thresh if size_thresh != 'default' else 'auto',
+        'size_thresh_upper': args.size_thresh_upper if args.size_thresh_upper else 'none',
+        'marker_thresh': args.marker_thresh if args.marker_thresh else 'auto',
+        'noise_thresh': args.noise_thresh,
+        'large_noise_thresh': large_noise_thresh if large_noise_thresh not in ['default', None] else 'auto',
+        'resolution': args.resolution,
+    }
+
+    sam_params = {
+        'prompt_mode': 'mask_only',
+        'mask_size': '256x256',
+        'multimask_output': True,
+        'num_prompts': len(clusters),
+    }
+
+    save_comparison(
+        output_dir, base_name, original_np,
+        seg_np, seg_overlaid_np, seg_refined_np, mask_np,
+        sam_mask_only_merged, sam_mask_only,
+        clusters=clusters,
+        scores_box_mask=[],
+        scores_mask_only=scores_mask_only,
+        deepliif_params=deepliif_params,
+        sam_params=sam_params,
+        marker=marker_np,
+        positive_cells_info=positive_cells_info,
+        filtered_box_mask=[],
+        filtered_mask_only=filtered_mask_only,
+        merge_info=[],
+        save_comparison_image=args.save_comparison,
+        save_combined_image=args.save_combined
+    )
+
+
+def save_grouping_visualization(original_image: np.ndarray, cell_groups: list,
+                                cells_info: list, distance_threshold: float,
+                                save_path: str):
+    """
+    保存分组过程的可视化图片：不同组用不同颜色，组内成员连线。
+    """
+    h, w = original_image.shape[:2]
+    viz = original_image.copy()
+
+    np.random.seed(42)
+    group_colors = np.random.randint(100, 255, size=(len(cell_groups) + 1, 3))
+
+    for group in cell_groups:
+        group_id = group['group_id']
+        color = tuple(int(c) for c in group_colors[group_id])
+        member_cells = group['member_cells']
+
+        for cell in member_cells:
+            coords = cell['coords']
+            rows = coords[:, 0].astype(np.intp)
+            cols = coords[:, 1].astype(np.intp)
+            viz[rows, cols] = (np.array(viz[rows, cols]) * 0.5 + np.array(color) * 0.5).astype(np.uint8)
+
+        if len(member_cells) > 1:
+            for i in range(len(member_cells)):
+                for j in range(i + 1, len(member_cells)):
+                    c1 = member_cells[i]['center']
+                    c2 = member_cells[j]['center']
+                    cv2.line(viz, (c1[1], c1[0]), (c2[1], c2[0]), color, 2)
+
+        center_y, center_x = group['center']
+        label = f"G{group_id}({len(member_cells)})"
+        cv2.putText(viz, label, (center_x - 20, center_y - 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 2)
+        cv2.putText(viz, label, (center_x - 20, center_y - 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+    cv2.putText(viz, f"Groups: {len(cell_groups)}, Threshold: {distance_threshold}px",
+               (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    cv2.putText(viz, f"Groups: {len(cell_groups)}, Threshold: {distance_threshold}px",
+               (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
+    cv2.imwrite(save_path, cv2.cvtColor(viz, cv2.COLOR_RGB2BGR))

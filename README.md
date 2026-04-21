@@ -16,14 +16,22 @@ cd34-microvessel-detection/
 │   ├── deepliif/               # DeepLIIF 推理与后处理
 │   ├── sam2_wrapper/           # SAM2 模型加载与推理
 │   ├── cell/                   # 细胞提取、分类、掩码操作
-│   ├── io/                     # 文件读写、LabelMe 导出、瓦片重建
+│   ├── io/                     # 文件读写、LabelMe 导出、GeoJSON 导出
 │   └── visualization/          # 可视化与对比图
 │
 ├── scripts/                    # 入口脚本与工具
-│   ├── run_pipeline.py         # 主 pipeline 入口
-│   ├── run_deepliif_only.py    # DeepLIIF 独立测试
-│   ├── reconstruct_tiles.py    # 瓦片重建
-│   └── ...
+│   ├── pipeline/
+│   │   ├── run_wsi_pipeline.py # WSI pipeline 入口
+│   │   └── run_deepliif_only.py# DeepLIIF 独立测试
+│   ├── analysis/
+│   │   ├── analyze_wsi_masks.py
+│   │   ├── visualize_reconstructed.py
+│   │   └── generate_ppt.py
+│   └── experimental/
+│       ├── merge_tiles_demo.py
+│       ├── test_interactive_sam2.py
+│       ├── test_mask_only.py
+│       └── visualize_results.py
 │
 ├── docs/                       # 文档
 │   └── parameters.md           # 参数详细说明
@@ -60,7 +68,7 @@ cd cd34-microvessel-detection
 # 安装依赖 (SAM2 会自动作为 pip 依赖安装)
 pip install -e .
 
-# 如需瓦片重建功能
+# 如需 GeoJSON 导出功能
 pip install -e ".[tile]"
 ```
 
@@ -68,21 +76,13 @@ pip install -e ".[tile]"
 
 ```bash
 # 完整 pipeline
-python scripts/run_pipeline.py \
-    --input-dir data/input \
+python scripts/pipeline/run_wsi_pipeline.py \
+    --wsi-path data/input/slide.ndpi \
     --output-dir data/output \
-    --deepliif-model-dir data/models/deepliif \
-    --sam-checkpoint data/models/sam2/sam2.1_hiera_large.pt \
-    --sam-config configs/sam2.1/sam2.1_hiera_l.yaml \
-    --export-labelme
+    --use-connected-regions --save-npy
 
 # 仅运行 DeepLIIF
-python scripts/run_deepliif_only.py --img data/input/sample.png
-
-# 瓦片重建
-python scripts/reconstruct_tiles.py \
-    --tile-dir data/output/npy_masks \
-    --output-dir data/output/reconstructed
+python scripts/pipeline/run_deepliif_only.py --img data/input/sample.png
 ```
 
 ## 参数说明

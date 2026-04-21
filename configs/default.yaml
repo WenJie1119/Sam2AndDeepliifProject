@@ -43,7 +43,6 @@ io:
 
 # ===== 输出控制 =====
 output:
-  save_deepliif_outputs: false
   save_combined: false
   save_comparison: false
   save_sam_outputs: false
@@ -54,5 +53,3 @@ output:
   save_original_sam_comparison: false
   save_cell_extraction_vis: false
   save_pipeline_vis: false
-  export_labelme: true
-  labelme_include_imagedata: false

@@ -4,7 +4,7 @@ import argparse
 from PIL import Image
 
 # 确保项目根目录在 path 中
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 def run_test(img_path=None):
     try:

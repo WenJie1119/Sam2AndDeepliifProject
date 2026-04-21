@@ -5,16 +5,13 @@ file_io.py — 文件输入输出模块
 包含：
 - 图像文件读写
 - CSV 导出
-- LabelMe JSON 导出
 - 结果保存辅助函数
 """
 
 import os
 import csv
 import json
-import base64
 import shutil
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -93,176 +90,24 @@ def save_positive_cells_csv(output_path: str, cells_info: list[dict]):
             ])
 
 
-def mask_to_labelme_json(instance_mask: np.ndarray, original_image_path: str, 
-                          image_array: np.ndarray, cells_info: list = None,
-                          include_image_data: bool = False, 
-                          simplify_contour: bool = True,
-                          epsilon_ratio: float = 0.002) -> dict:
-    """
-    将实例分割掩码转换为 LabelMe JSON 格式。
-    
-    通过提取每个实例的轮廓并转换为多边形点序列，生成可被 LabelMe 工具打开的 JSON 文件。
-    
-    Args:
-        instance_mask: 实例掩码数组 (H, W)，每个像素值为实例ID (0=背景, 1,2,3...=实例)
-        original_image_path: 原始图像路径 (用于 imagePath 字段)
-        image_array: 原始图像数组 RGB (用于获取尺寸和可选的 base64 编码)
-        cells_info: 可选的细胞信息列表，用于生成更丰富的标签
-        include_image_data: 是否在 JSON 中嵌入 base64 编码的图像数据
-        simplify_contour: 是否简化轮廓以减少点数 (使用 Douglas-Peucker 算法)
-        epsilon_ratio: 轮廓简化的容差比例 (相对于轮廓周长)
-    
-    Returns:
-        dict: LabelMe 格式的字典，可直接 json.dump 保存
-    """
-    h, w = instance_mask.shape[:2]
-    shapes = []
-    
-    # 获取所有唯一的实例ID（排除背景0）
-    instance_ids = np.unique(instance_mask)
-    instance_ids = instance_ids[instance_ids > 0]
-    
-    # 用于生成连续的 group_id
-    continuous_group_id = 0
-    
-    for inst_id in instance_ids:
-        # 创建单实例二值掩码
-        binary_mask = (instance_mask == inst_id).astype(np.uint8) * 255
-        
-        # 提取轮廓 (RETR_EXTERNAL 只获取外轮廓，忽略孔洞)
-        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, 
-                                        cv2.CHAIN_APPROX_SIMPLE)
-        
-        for contour in contours:
-            if len(contour) < 3:  # 多边形至少需要3个点
-                continue
-            
-            # 可选：使用 Douglas-Peucker 算法简化轮廓
-            if simplify_contour:
-                epsilon = epsilon_ratio * cv2.arcLength(contour, True)
-                contour = cv2.approxPolyDP(contour, epsilon, True)
-            
-            # 转换为 LabelMe 格式的点列表 [[x1, y1], [x2, y2], ...]
-            points = [[float(pt[0][0]), float(pt[0][1])] for pt in contour]
-            
-            # 生成连续的 group_id
-            continuous_group_id += 1
-            
-            # 生成标签
-            label = "cell"
-            group_id = continuous_group_id  # 使用连续编号
-            
-            # 如果有细胞信息，添加更丰富的标签
-            if cells_info and int(inst_id) <= len(cells_info):
-                cell = cells_info[int(inst_id) - 1]  # 1-based index
-                is_positive = cell.get('is_positive', True)
-                
-                # 标签格式: positive_cell 或 negative_cell (统一类名，不带编号)
-                label = "positive_cell" if is_positive else "negative_cell"
-            
-            shapes.append({
-                "label": label,
-                "points": points,
-                "group_id": group_id,
-                "shape_type": "polygon",
-                "flags": {},
-                "description": ""
-            })
-    
-    # 构建 LabelMe JSON 结构
-    labelme_data = {
-        "version": "5.0.1",
-        "flags": {},
-        "shapes": shapes,
-        "imagePath": Path(original_image_path).name,
-        "imageData": None,
-        "imageHeight": h,
-        "imageWidth": w
-    }
-    
-    # 可选：嵌入 base64 图像数据
-    if include_image_data and image_array is not None:
-        import io
-        img_pil = Image.fromarray(image_array)
-        buffered = io.BytesIO()
-        img_pil.save(buffered, format="PNG")
-        labelme_data["imageData"] = base64.b64encode(buffered.getvalue()).decode('utf-8')
-    
-    return labelme_data
-
-
-def export_labelme_annotation(output_dir: str, base_name: str, 
-                               instance_mask: np.ndarray, 
-                               original_image_array: np.ndarray,
-                               cells_info: list = None,
-                               include_image_data: bool = False,
-                               original_image_path: str = None) -> tuple[str, int]:
-    """
-    导出 SAM2 分割结果为 LabelMe JSON 格式。
-    
-    Args:
-        output_dir: 输出目录 (会在其中创建 labelme 子目录)
-        base_name: 基础文件名 (不含扩展名)
-        instance_mask: 实例分割掩码 (H, W)
-        original_image_array: 原始图像数组 RGB
-        cells_info: 可选的细胞信息列表
-        include_image_data: 是否在 JSON 中嵌入 base64 图像
-        original_image_path: 原始图像的绝对路径 (用于 imagePath 字段)
-    
-    Returns:
-        tuple: (JSON文件路径, 多边形数量)
-    """
-    # 创建 labelme 输出目录
-    labelme_dir = os.path.join(output_dir, "labelme")
-    os.makedirs(labelme_dir, exist_ok=True)
-    
-    # 定义输出文件路径
-    json_filename = f"{base_name}.json"
-    json_path = os.path.join(labelme_dir, json_filename)
-    
-    # imagePath 使用原始图像的绝对路径（成功后原图会被移动到 labelme/）
-    if original_image_path:
-        # 使用文件名（因为原图会被移动到同目录）
-        image_path_for_json = os.path.basename(original_image_path)
-    else:
-        image_path_for_json = f"{base_name}.png"
-    
-    # 生成 LabelMe JSON
-    labelme_data = mask_to_labelme_json(
-        instance_mask=instance_mask,
-        original_image_path=image_path_for_json,
-        image_array=original_image_array,
-        cells_info=cells_info,
-        include_image_data=include_image_data,
-        simplify_contour=True,
-        epsilon_ratio=0.01
-    )
-    
-    # 保存 JSON 文件
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(labelme_data, f, indent=2, ensure_ascii=False)
-    
-    num_shapes = len(labelme_data['shapes'])
-    print(f"    LabelMe export: {num_shapes} polygons -> {json_path}")
-    
-    return json_path, num_shapes
-
-
-def save_deepliif_outputs(results: dict, output_dir: str, base_name: str):
+def save_deepliif_outputs(results: dict, save_dir: str, prefix: str = "step2_deepliif",
+                          save_all: bool = False):
     """
     保存 DeepLIIF 推理结果到指定目录。
-    
+
     Args:
         results: DeepLIIF 推理返回的字典 (key -> PIL.Image)
-        output_dir: 输出根目录
-        base_name: 图像基础名称
+        save_dir: 保存目录
+        prefix: 文件名前缀，生成 {prefix}_{key}.png
+        save_all: False 只保存 Seg 和 Marker，True 保存全部
     """
-    deepliif_out_dir = os.path.join(output_dir, "deepliif_outputs", base_name)
-    os.makedirs(deepliif_out_dir, exist_ok=True)
-    
+    os.makedirs(save_dir, exist_ok=True)
+
     for key, val_img in results.items():
         if isinstance(val_img, Image.Image):
-            val_img.save(f"{deepliif_out_dir}/{key}.png")
+            if not save_all and key not in ('Seg', 'Marker'):
+                continue
+            val_img.save(os.path.join(save_dir, f"{prefix}_{key}.png"))
 
 
 def save_sam2_mask_visualization(mask_data: np.ndarray, 
@@ -346,22 +191,20 @@ def save_sam2_mask_visualization(mask_data: np.ndarray,
     cv2.imwrite(output_path, cv2.cvtColor(labeled_img, cv2.COLOR_RGB2BGR))
 
 
-def save_mask_npy(mask: np.ndarray, output_path: str, 
-                  metadata: dict = None) -> str:
+def save_mask_npy(mask: np.ndarray, output_path: str) -> str:
     """
     保存实例分割 mask 为 npy 格式。
-    
+
     Args:
         mask: 实例分割掩码 (H, W)，每个像素值为实例ID (0=背景)
         output_path: 输出文件路径 (.npy)
-        metadata: 可选的元数据字典，将保存为同名 .json 文件
-        
+
     Returns:
         str: 保存的 npy 文件路径
     """
     # 确保输出目录存在
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
+
     # 根据实例数量选择合适的数据类型
     max_id = int(np.max(mask))
     if max_id <= 255:
@@ -370,44 +213,28 @@ def save_mask_npy(mask: np.ndarray, output_path: str,
         save_mask = mask.astype(np.uint16)
     else:
         save_mask = mask.astype(np.uint32)
-    
+
     # 保存 npy 文件
     np.save(output_path, save_mask)
-    
-    # 如果有元数据，保存为同名 json 文件
-    if metadata:
-        json_path = output_path.replace('.npy', '_meta.json')
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, indent=2, ensure_ascii=False)
-    
+
     print(f"    Saved mask npy: {output_path} (dtype={save_mask.dtype}, max_id={max_id})")
     return output_path
 
 
-def load_mask_npy(npy_path: str) -> tuple[np.ndarray, dict]:
+def load_mask_npy(npy_path: str) -> np.ndarray:
     """
     加载 npy 格式的实例分割 mask。
-    
+
     Args:
         npy_path: npy 文件路径
-        
+
     Returns:
-        tuple: (mask数组, 元数据字典或None)
+        mask 数组
     """
-    mask = np.load(npy_path)
-    
-    # 尝试加载元数据
-    json_path = npy_path.replace('.npy', '_meta.json')
-    metadata = None
-    if os.path.exists(json_path):
-        with open(json_path, 'r', encoding='utf-8') as f:
-            metadata = json.load(f)
-    
-    return mask, metadata
+    return np.load(npy_path)
 
 
-def save_seg_probability_npy(seg_image, output_path: str, 
-                              metadata: dict = None) -> str:
+def save_seg_probability_npy(seg_image, output_path: str) -> str:
     """
     保存 DeepLIIF Seg 概率图为 npy 格式。
     
@@ -445,71 +272,9 @@ def save_seg_probability_npy(seg_image, output_path: str,
     
     # 保存为 uint8 npy
     np.save(output_path, seg_array.astype(np.uint8))
-    
-    # 构建默认元数据
-    default_metadata = {
-        'format': 'DeepLIIF_Seg_Probability',
-        'channels': {
-            'R (channel 0)': 'positive_probability',
-            'G (channel 1)': 'background_probability', 
-            'B (channel 2)': 'negative_probability'
-        },
-        'dtype': 'uint8',
-        'shape': list(seg_array.shape),
-        'usage': 'R + B > threshold && G <= 80 -> cell; R >= B -> positive, R < B -> negative'
-    }
-    
-    # 合并用户提供的元数据
-    if metadata:
-        default_metadata.update(metadata)
-    
-    # 保存元数据
-    json_path = output_path.replace('.npy', '_meta.json')
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(default_metadata, f, indent=2, ensure_ascii=False)
-    
+
     print(f"    Saved Seg probability npy: {output_path} (shape={seg_array.shape})")
     return output_path
-
-
-def prepare_resume_skip_set(output_dir: str, resume: bool) -> set:
-    """
-    断点续传：扫描已完成的 labelme JSON，返回需要跳过的图像名集合。
-    最后一个 JSON 会被删除（可能不完整），其余加入跳过集合。
-    """
-    skip_set = set()
-    if not resume:
-        return skip_set
-
-    labelme_dir = os.path.join(output_dir, "labelme")
-    if not os.path.exists(labelme_dir):
-        print(f"\n[RESUME] Output directory not found. Starting from beginning.")
-        return skip_set
-
-    existing_jsons = []
-    for f in os.listdir(labelme_dir):
-        if f.endswith('.json'):
-            json_path = os.path.join(labelme_dir, f)
-            mtime = os.path.getmtime(json_path)
-            base = os.path.splitext(f)[0]
-            existing_jsons.append((base, json_path, mtime))
-
-    if not existing_jsons:
-        print(f"\n[RESUME] No existing JSON files found. Starting from beginning.")
-        return skip_set
-
-    existing_jsons.sort(key=lambda x: x[2], reverse=True)
-    latest_base, latest_path, _ = existing_jsons[0]
-
-    os.remove(latest_path)
-    print(f"\n[RESUME] Deleted last JSON (may be incomplete): {latest_path}")
-
-    for base, path, _ in existing_jsons[1:]:
-        skip_set.add(base)
-
-    print(f"[RESUME] Will skip {len(skip_set)} already processed images.")
-    print(f"[RESUME] Will re-process from: {latest_base}")
-    return skip_set
 
 
 def handle_no_positive_cells(img_path: str, img_name: str, output_dir: str, base_name: str):
@@ -531,16 +296,6 @@ def handle_no_positive_cells(img_path: str, img_name: str, output_dir: str, base
         dest_bg = os.path.join(no_positive_dir, f"{base_name}_background.png")
         shutil.move(bg_file, dest_bg)
         print(f"    Moved background file to: {dest_bg}")
-
-    # 移动 labelme 文件 (如果存在)
-    labelme_dir = os.path.join(output_dir, "labelme")
-    if os.path.exists(labelme_dir):
-        for ext, suffix in [('.json', '.json'), ('.png', '_labelme.png')]:
-            src = os.path.join(labelme_dir, f"{base_name}{ext}")
-            if os.path.exists(src):
-                dest = os.path.join(no_positive_dir, f"{base_name}{suffix}")
-                shutil.move(src, dest)
-                print(f"    Moved {src} to: {dest}")
 
 
 def save_cell_groups_csv(cell_groups: list, output_dir: str, base_name: str,
@@ -605,52 +360,167 @@ def save_merged_regions_csv(sam_mask_merged: np.ndarray, scores_merged: list,
     print(f"    Total {len(unique_ids)} regions")
 
 
-def export_and_handle_labelme(output_dir: str, base_name: str, sam_mask_merged: np.ndarray,
-                              original_np: np.ndarray, merged_cells_info: list,
-                              img_path: str, img_name: str, args) -> int:
+def compute_geojson_statistics(geojson_path: str, output_dir: str = None) -> dict:
     """
-    导出 LabelMe 标注并处理结果：成功则移动原图到 labelme/，失败则移到 sam2_failed/。
-    返回 shape 数量。
+    读取 GeoJSON 文件，计算每个区域的面积、重心，以及全局统计（数量、面积均值、面积标准差）。
+
+    使用 Shoelace 公式计算多边形面积和重心，不依赖 shapely。
+
+    Args:
+        geojson_path: GeoJSON 文件路径（list of Features，或 FeatureCollection）
+        output_dir: 输出目录，若提供则保存 CSV 统计文件
+
+    Returns:
+        dict: {
+            'count': int,
+            'area_mean': float,
+            'area_std': float,
+            'regions': list[dict]  # 每个 dict: {id, area, centroid_x, centroid_y}
+        }
     """
-    print("  > Exporting to LabelMe format...")
-    json_path, num_shapes = export_labelme_annotation(
-        output_dir=output_dir,
-        base_name=base_name,
-        instance_mask=sam_mask_merged,
-        original_image_array=original_np,
-        cells_info=merged_cells_info,
-        include_image_data=args.labelme_include_imagedata,
-        original_image_path=img_path
-    )
+    import math
 
-    if num_shapes == 0:
-        # SAM2 分割失败：删除空 JSON，移原图到 sam2_failed/
-        print("    WARNING: SAM2 produced no valid segmentations!")
-        sam2_failed_dir = os.path.join(output_dir, "sam2_failed")
-        os.makedirs(sam2_failed_dir, exist_ok=True)
+    with open(geojson_path, 'r') as f:
+        data = json.load(f)
 
-        if os.path.exists(json_path):
-            os.remove(json_path)
-            print(f"    Deleted empty JSON: {json_path}")
-
-        if os.path.exists(img_path):
-            shutil.move(img_path, os.path.join(sam2_failed_dir, img_name))
-            print(f"    Moved original image to: {sam2_failed_dir}/{img_name}")
-
-        labelme_img = os.path.join(output_dir, "labelme", f"{base_name}.png")
-        if os.path.exists(labelme_img):
-            os.remove(labelme_img)
-            print(f"    Removed duplicate from labelme/")
+    # 兼容 FeatureCollection 和裸 list
+    if isinstance(data, dict) and 'features' in data:
+        features = data['features']
+    elif isinstance(data, list):
+        features = data
     else:
-        # 成功：移动原图到 labelme/
-        labelme_dir = os.path.join(output_dir, "labelme")
-        if os.path.exists(img_path):
-            dest_img = os.path.join(labelme_dir, img_name)
-            shutil.move(img_path, dest_img)
-            print(f"    Moved original image to: {dest_img}")
-        print(f"    Use command: labelme {output_dir}/labelme/{base_name}.json")
+        print(f"  WARNING: Unrecognized GeoJSON format in {geojson_path}")
+        return {'count': 0, 'area_mean': 0, 'area_std': 0, 'regions': []}
 
-    return num_shapes
+    def _polygon_area_and_centroid(ring):
+        """Shoelace 公式计算多边形面积和重心。"""
+        n = len(ring)
+        if n > 1 and ring[0] == ring[-1]:
+            n -= 1
+        if n < 3:
+            return 0.0, 0.0, 0.0
+
+        signed_area = 0.0
+        cx = 0.0
+        cy = 0.0
+        for i in range(n):
+            j = (i + 1) % n
+            cross = ring[i][0] * ring[j][1] - ring[j][0] * ring[i][1]
+            signed_area += cross
+            cx += (ring[i][0] + ring[j][0]) * cross
+            cy += (ring[i][1] + ring[j][1]) * cross
+
+        area = abs(signed_area) / 2.0
+        if area > 0:
+            cx = abs(cx) / (6.0 * area)
+            cy = abs(cy) / (6.0 * area)
+        else:
+            cx = sum(p[0] for p in ring[:n]) / n
+            cy = sum(p[1] for p in ring[:n]) / n
+        return area, cx, cy
+
+    regions = []
+    for idx, feat in enumerate(features):
+        geom = feat.get('geometry', {})
+        coords = geom.get('coordinates', [])
+        if geom.get('type') == 'Polygon' and len(coords) > 0:
+            ring = coords[0]
+            area, cx, cy = _polygon_area_and_centroid(ring)
+        else:
+            area, cx, cy = 0.0, 0.0, 0.0
+
+        regions.append({
+            'id': idx + 1,
+            'area': area,
+            'centroid_x': cx,
+            'centroid_y': cy,
+        })
+
+    count = len(regions)
+    areas = [r['area'] for r in regions]
+
+    if count > 0:
+        area_mean = sum(areas) / count
+        area_std = math.sqrt(sum((a - area_mean) ** 2 for a in areas) / count)
+    else:
+        area_mean = 0.0
+        area_std = 0.0
+
+    # 保存 CSV
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(geojson_path))[0]
+        csv_path = os.path.join(output_dir, f"{stem}_statistics.csv")
+
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['region_id', 'area_px2', 'centroid_x', 'centroid_y'])
+            for r in regions:
+                writer.writerow([r['id'], f"{r['area']:.2f}",
+                                 f"{r['centroid_x']:.2f}", f"{r['centroid_y']:.2f}"])
+
+        # 写入汇总行
+        summary_path = os.path.join(output_dir, f"{stem}_summary.csv")
+        with open(summary_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['metric', 'value'])
+            writer.writerow(['count', count])
+            writer.writerow(['area_mean', f"{area_mean:.2f}"])
+            writer.writerow(['area_std', f"{area_std:.2f}"])
+            writer.writerow(['area_min', f"{min(areas):.2f}" if areas else '0'])
+            writer.writerow(['area_max', f"{max(areas):.2f}" if areas else '0'])
+
+        print(f"  Statistics CSV: {csv_path}")
+        print(f"  Summary CSV:    {summary_path}")
+
+        # 面积分布直方图
+        if count > 0:
+            hist_path = os.path.join(output_dir, f"{stem}_area_histogram.png")
+            try:
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as plt
+
+                areas_np = np.array(areas)
+                fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+                # 左图：线性尺度
+                axes[0].hist(areas_np, bins=100, color='steelblue', edgecolor='white')
+                axes[0].set_xlabel('Area (px\u00b2)')
+                axes[0].set_ylabel('Count')
+                axes[0].set_title(f'Area Distribution (n={count})')
+                axes[0].axvline(np.median(areas_np), color='red', linestyle='--',
+                                label=f'median={np.median(areas_np):.0f}')
+                axes[0].axvline(area_mean, color='orange', linestyle='-.',
+                                label=f'mean={area_mean:.0f}')
+                axes[0].legend()
+
+                # 右图：log 尺度
+                log_min = np.log10(max(1, areas_np.min()))
+                log_max = np.log10(max(2, areas_np.max()))
+                axes[1].hist(areas_np, bins=np.logspace(log_min, log_max, 80),
+                             color='steelblue', edgecolor='white')
+                axes[1].set_xscale('log')
+                axes[1].set_xlabel('Area (px\u00b2, log scale)')
+                axes[1].set_ylabel('Count')
+                axes[1].set_title('Log-scale Distribution')
+                axes[1].axvline(np.median(areas_np), color='red', linestyle='--',
+                                label=f'median={np.median(areas_np):.0f}')
+                axes[1].legend()
+
+                plt.tight_layout()
+                plt.savefig(hist_path, dpi=150)
+                plt.close()
+                print(f"  Histogram:      {hist_path}")
+            except ImportError:
+                print("  (matplotlib not available, skipping histogram)")
+
+    return {
+        'count': count,
+        'area_mean': area_mean,
+        'area_std': area_std,
+        'regions': regions,
+    }
 
 
 def save_sam2_outputs(sam_out_dir: str, original_np: np.ndarray,

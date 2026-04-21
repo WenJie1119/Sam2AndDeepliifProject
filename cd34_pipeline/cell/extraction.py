@@ -636,7 +636,8 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
                                         seg_thresh: int = 120,
                                         marker_thresh: Optional[int] = None,
                                         morphology_kernel: int = 11,
-                                        min_area: int = 200) -> list:
+                                        min_area: int = 200,
+                                        debug_dir: Optional[str] = None) -> list:
     """
     Seg + Marker 联合提取连通的阳性区域。
 
@@ -662,6 +663,7 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
         morphology_kernel: 形态学闭运算核大小，越大连接性越强
                           推荐值: 7-15 (默认11)
         min_area: 最小区域面积（像素数），过滤小碎片 (默认200)
+        debug_dir: 如果非 None，在该目录保存每步中间结果的可视化图
 
     Returns:
         regions_info: 列表，每个元素包含：
@@ -685,8 +687,27 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
         marker_thresh = compute_marker_threshold(marker_gray)
         print(f"    [Connected Region] Auto marker_thresh: {marker_thresh}")
 
-    # === Step 1: 从 Seg 提取前景 ===
+    # 用于保存 debug 图片的辅助函数
+    def _save_debug(name, img):
+        if debug_dir is not None:
+            import os
+            from PIL import Image as _PILImage
+            os.makedirs(debug_dir, exist_ok=True)
+            if isinstance(img, np.ndarray):
+                _PILImage.fromarray(img).save(os.path.join(debug_dir, name))
+
+    # === Step 1: 从 Seg 提取��景 ===
     posneg_mask, is_foreground, _ = compute_posneg_mask(seg_array, seg_thresh)
+
+    if debug_dir is not None:
+        # 前景掩码可视化: 白色=前景, 黑色=背景
+        fg_vis = (is_foreground.astype(np.uint8) * 255)
+        _save_debug("cr_step1_foreground_mask.png", fg_vis)
+        # 阳性/阴性像素分布: 红=阳性, 蓝=阴性
+        posneg_vis = np.zeros((*seg_array.shape[:2], 3), dtype=np.uint8)
+        posneg_vis[posneg_mask == 2] = [255, 0, 0]   # 阳性=红
+        posneg_vis[posneg_mask == 1] = [0, 0, 255]    # 阴性=蓝
+        _save_debug("cr_step1_posneg_mask.png", posneg_vis)
 
     # === Step 2: 确定阳性像素（Seg阳性 OR Marker强阳性） ===
     # Seg 判断的阳性: posneg_mask == 2 (即 R >= B 的前景像素)
@@ -695,8 +716,22 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
     # Marker 增强: 在前景区域中，marker值超过阈值的也视为阳性
     marker_positive = is_foreground & (marker_gray > marker_thresh)
 
+    if debug_dir is not None:
+        # Seg 阳性像素（绿色）
+        seg_pos_vis = np.zeros((*seg_array.shape[:2], 3), dtype=np.uint8)
+        seg_pos_vis[seg_positive] = [0, 255, 0]
+        _save_debug("cr_step2a_seg_positive.png", seg_pos_vis)
+        # Marker 增强的像素（黄色=仅Marker增强, 绿色=Seg已有）
+        marker_vis = np.zeros((*seg_array.shape[:2], 3), dtype=np.uint8)
+        marker_vis[seg_positive] = [0, 255, 0]
+        marker_vis[marker_positive & ~seg_positive] = [255, 255, 0]
+        _save_debug("cr_step2b_marker_enhanced.png", marker_vis)
+
     # 联合: 两者取并集
     positive_pixels = (seg_positive | marker_positive).astype(np.uint8) * 255
+
+    if debug_dir is not None:
+        _save_debug("cr_step2c_combined_positive.png", positive_pixels)
 
     print(f"    [Connected Region] Seg positive pixels: {np.sum(seg_positive)}, "
           f"Marker enhanced: {np.sum(marker_positive & ~seg_positive)}, "
@@ -707,9 +742,15 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
                                        (morphology_kernel, morphology_kernel))
     positive_pixels = cv2.morphologyEx(positive_pixels, cv2.MORPH_CLOSE, kernel, iterations=2)
 
+    if debug_dir is not None:
+        _save_debug("cr_step3_morph_close.png", positive_pixels)
+
     # === Step 4: 形态学开运算 — 去除小噪点 ===
     kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     positive_pixels = cv2.morphologyEx(positive_pixels, cv2.MORPH_OPEN, kernel_open)
+
+    if debug_dir is not None:
+        _save_debug("cr_step4_morph_open.png", positive_pixels)
 
     # === Step 5: 连通组件分析（8-连通） ===
     num_labels, labels = cv2.connectedComponents(positive_pixels, connectivity=8)
@@ -740,5 +781,18 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
             'marker_min': int(marker_values.min()),
             'is_positive': True
         })
+
+    if debug_dir is not None:
+        # 最终连通区域可视化 — 每个区域不同颜色，叠加在 Seg 原图上
+        cc_vis = seg_array.copy() if seg_array.ndim == 3 else cv2.cvtColor(seg_array, cv2.COLOR_GRAY2RGB)
+        cc_vis = cc_vis.astype(np.float32)
+        for ri in regions_info:
+            rid = ri['id']
+            color = np.array([(rid * 67) % 256, (rid * 137) % 256, (rid * 221) % 256],
+                             dtype=np.float32)
+            rows_i, cols_i = ri['coords'][:, 0], ri['coords'][:, 1]
+            cc_vis[rows_i, cols_i] = cc_vis[rows_i, cols_i] * 0.4 + color * 0.6
+        _save_debug(f"cr_step5_connected_regions_{len(regions_info)}.png",
+                    cc_vis.astype(np.uint8))
 
     return regions_info

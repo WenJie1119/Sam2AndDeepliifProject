@@ -7,7 +7,7 @@ cd34_pipeline - CD34 微血管检测 Pipeline
 - deepliif: DeepLIIF 模型推理与后处理
 - sam2_wrapper: SAM2 模型加载与推理封装
 - cell: 细胞提取、分类与掩码操作
-- io: 文件读写、CSV/LabelMe 导出、瓦片重建
+- io: 文件读写、CSV/GeoJSON 导出、瓦片重建
 - visualization: 可视化与对比图生成
 """
 

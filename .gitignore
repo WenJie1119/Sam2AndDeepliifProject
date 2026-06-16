@@ -45,6 +45,15 @@ test_results/
 # Jupyter
 *-checkpoint.ipynb
 
+# Runtime outputs
+output/
+outputs/
+cell_test_output/
+debug.log
+
+# Tool configs
+.claude/
+.codex
+
 # Misc
-outputs/*
 _C.*

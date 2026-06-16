@@ -1,0 +1,43 @@
+问：
+我在调试的是发现了问题，执行调试程序命令行，对这个区域进行查看--debug-region-um 8121,7066,8253,7054,8274,7289,8125,7278 最终的Geojson结果相差很大，
+sample_output_top_1_4下的结果不好，而相对的debug的Geojson较好，请查明原因
+调试命令行：
+"  python -m cell.main \
+    --wsi-path "data/CD34InputData/RawData/DC2200155 A3 CD34.ndpi" \
+    --roi-json data/CD34InputData/RoiRegion/40xroi_DC2200155_A3_CD34.roi.json \
+    --output-dir debug_output/debug_region_smoke \
+    --device cuda:0 \
+    --debug-region-um 8121,7066,8253,7054,8274,7289,8125,7278 \
+    --deepliif-batch-size 16 \
+    --sam2-batch-size 16  "
+俩个结果
+outputs/sample_output_top_1_4 /DC2200155 A3 CD34.geojson和debug_output/debug_region_smoke/DC2200155 A3 CD34.geojson 下的结果不一样
+答：
+
+• 我读完并对比了两个 GeoJSON。结论：差异不是坐标换算问题，主要是 sample_output_top_1_4 里发生了异常的跨 tile 过合并；debug region 看起来好，是
+  因为它只处理 30 个局部 tile，合并图被限制住了。
+
+  关键证据：
+
+  - sample_output_top_1_4 是 2026-05-09 生成的，debug 输出是 2026-06-03 生成的，不是同一次、同一上下文的结果。
+  - debug region 只选了 30 个 tile：row 37..42、col 11..15。
+  - sample 的最大区域面积是 1,012,860.50 px²，debug 最大只有 46,378.00 px²。
+  - 在 exact debug bbox 内，sample 有一个 152,636 px² 的大对象几乎占满该区域；debug 中相同位置是多个较小对象。
+  - sample 的 top 1/4 输出 y 范围正好到 35872，并且很多异常大对象贴着 y=35870/35871 的裁剪底边，说明 partial crop 边界也在放大问题。
+
+  代码上的直接机制在 cd34_pipeline/io/tile_reconstruction.py:390：Pass 2 只要相邻 tile 的 overlap 区域有任意前景像素重叠，就用 Union-Find 合并
+  实例。这个条件太宽松，一旦 SAM2 在某些 tile 上产生较大的假阳性 mask，就会沿着 overlap 一路串联，最终变成 sample 里的巨型 polygon。
+
+  debug 命令走的是 cell/main.py:995 的 enumerate_debug_region_tiles()，只取 bbox 相交 tile 加一圈邻居；普通 sample/top1_4 走的是全 ROI/top
+  quarter 的 enumerate_tiles_in_roi()。所以 debug 输出“较好”并不代表 sample 同区域的单 tile 推理一定差，而是 sample 的全局重建上下文让错误合并
+  继续传播了。
+
+  另外当前代码默认会做原图 DAB 过滤，见 cell/segmentation.py:58。如果 5 月 9 日的 sample 是这个过滤逻辑加入前或参数不同的时候生成的，它会保留更
+  多错误候选，进一步增加过合并概率。
+
+  建议后续验证/修复方向：
+
+  - 用当前代码、相同参数重新跑一次 top:1/4，不要拿旧 sample 和新 debug 直接比。
+  - 在 overlap 合并处加阈值，例如最小重叠像素数、IoU/overlap ratio，避免“任意像素重叠即合并”。
+  - 对异常大组件加面积或形状过滤，尤其是 partial crop 边界处的对象。
+  - 可先禁用对角邻居合并或提高对角合并阈值，降低串联风险。

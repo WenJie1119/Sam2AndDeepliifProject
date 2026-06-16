@@ -446,8 +446,8 @@ def save_connected_region_visualization(seg_array: np.ndarray,
     展示 Seg+Marker 联合提取连通阳性区域的完整过程：
         Step 1: Seg 前景提取
         Step 2: Seg 阳性像素 (R >= B)
-        Step 3: Marker 增强阳性像素
-        Step 4: 联合阳性像素 (Seg | Marker)
+        Step 3: Marker 阈值阳性像素
+        Step 4: 联合阳性像素 (Seg & Marker)
         Step 5: 形态学闭运算（连接近邻像素）
         Step 6: 最终连通区域 + SAM2 Prompts
         + Summary 汇总图
@@ -481,7 +481,7 @@ def save_connected_region_visualization(seg_array: np.ndarray,
     cv2.imwrite(os.path.join(vis_dir, "step2_seg_positive_pixels.png"),
                 cv2.cvtColor(seg_pos_vis, cv2.COLOR_RGB2BGR))
 
-    # ========== Step 3: Marker 增强 ==========
+    # ========== Step 3: Marker 阈值阳性 ==========
     marker_positive = is_foreground & (marker_gray > marker_thresh)
     marker_enhance_vis = np.zeros((h, w, 3), dtype=np.uint8)
     marker_enhance_vis[marker_positive] = [255, 165, 0]  # 橙色 = Marker阳性
@@ -500,13 +500,13 @@ def save_connected_region_visualization(seg_array: np.ndarray,
 
     # ========== Step 4: 联合阳性像素 ==========
     seg_positive = (posneg_mask == 2)
-    combined_positive = seg_positive | marker_positive
+    combined_positive = seg_positive & marker_positive
     combined_vis = np.zeros((h, w, 3), dtype=np.uint8)
-    # Seg 独有: 红色
+    # Seg 独有: 红色，仅作为诊断，不进入 combined_positive
     seg_only = seg_positive & ~marker_positive
-    # Marker 独有: 橙色
+    # Marker 独有: 橙色，仅作为诊断，不进入 combined_positive
     marker_only = marker_positive & ~seg_positive
-    # 两者都有: 黄色
+    # 两者都有: 黄色，进入 combined_positive
     both = seg_positive & marker_positive
     combined_vis[seg_only] = [255, 0, 0]
     combined_vis[marker_only] = [255, 165, 0]
@@ -596,8 +596,8 @@ def save_connected_region_visualization(seg_array: np.ndarray,
 
     # Row 2: 连接过程
     axes[1, 0].imshow(combined_vis)
-    axes[1, 0].set_title(f'5. Combined (Seg|Marker)\n'
-                         f'Red=Seg, Orange=Marker, Yellow=Both', fontsize=10)
+    axes[1, 0].set_title(f'5. Intersection (Seg&Marker)\n'
+                         f'Red=Seg only, Orange=Marker only, Yellow=Both', fontsize=10)
     axes[1, 0].axis('off')
 
     axes[1, 1].imshow(morph_compare)

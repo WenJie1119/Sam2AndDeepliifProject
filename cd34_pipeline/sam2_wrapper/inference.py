@@ -9,6 +9,8 @@ sam2_inference.py — SAM2 推理模块
 
 import numpy as np
 import cv2
+import torch
+import torch.nn.functional as F
 
 from cd34_pipeline.cell.mask_utils import (
     generate_mask_from_cluster,
@@ -298,6 +300,353 @@ def run_sam2_grouped_segmentation(predictor, image: np.ndarray, cell_groups: lis
     return combined_mask, scores_list, filtered_list
 
 
+def run_sam2_multi_image_batch(predictor, images: list, clusters_list: list,
+                                min_area: int = 10,
+                                prompt_batch_size: int = 64,
+                                score_threshold: float = 0.0) -> list:
+    """
+    多图批量 SAM2 推理。
+
+    不调用 predictor 的批量 set-image 封装接口。这里直接调用 SAM2 的
+    forward_image() 批量执行 encoder，然后把所有图片上的有效
+    mask prompts 展平成全局 prompt batch，按 prompt 所属图片索引
+    对齐 image/high-res features 后批量执行 prompt_encoder + mask_decoder。
+
+    Args:
+        predictor: SAM2ImagePredictor instance
+        images: M 张 RGB 图像列表，每张 (H, W, 3) np.ndarray
+        clusters_list: M 个 cluster 列表，clusters_list[i] 对应 images[i]
+        min_area: 最小 cluster 面积（像素数）
+        prompt_batch_size: 全局 prompt 批大小
+        score_threshold: 置信度阈值，低于此值的实例被过滤
+
+    Returns:
+        长度 M 的列表，每项为 (combined_mask, scores_list, filtered_list)
+    """
+    num_images = len(images)
+    if num_images == 0:
+        return []
+    if len(clusters_list) != num_images:
+        raise ValueError(
+            f"clusters_list length ({len(clusters_list)}) must match images length ({num_images})"
+        )
+
+    orig_hws = []
+    for image in images:
+        if not isinstance(image, np.ndarray):
+            raise TypeError("images must be np.ndarray arrays in RGB HWC format")
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError(
+                "images must be RGB arrays with shape (H, W, 3); "
+                f"got {image.shape}"
+            )
+        orig_hws.append(tuple(image.shape[:2]))
+
+    image_groups = {}
+    for img_idx, orig_hw in enumerate(orig_hws):
+        image_groups.setdefault(orig_hw, []).append(img_idx)
+
+    image_group_positions = np.empty(num_images, dtype=np.int64)
+    combined_masks_by_hw = {}
+    score_maps_by_hw = {}
+    prompt_records_by_hw = {orig_hw: [] for orig_hw in image_groups}
+    for orig_hw, img_indices in image_groups.items():
+        img_indices_arr = np.asarray(img_indices, dtype=np.int64)
+        image_group_positions[img_indices_arr] = np.arange(len(img_indices_arr))
+        h_img, w_img = orig_hw
+        combined_masks_by_hw[orig_hw] = np.zeros(
+            (len(img_indices), h_img, w_img), dtype=np.uint8
+        )
+        score_maps_by_hw[orig_hw] = np.zeros(
+            (len(img_indices), h_img, w_img), dtype=np.float32
+        )
+
+    score_records = []
+    filtered_records = []
+
+    for img_idx, clusters in enumerate(clusters_list):
+        if clusters is None:
+            continue
+        for cluster_idx, cluster in enumerate(clusters):
+            if len(cluster) >= min_area:
+                prompt_records_by_hw[orig_hws[img_idx]].append(
+                    (img_idx, cluster_idx, cluster)
+                )
+
+    num_prompts = sum(len(records) for records in prompt_records_by_hw.values())
+
+    with torch.no_grad():
+        # 1. 手动 batch 编码所有图像，避免走 predictor 的批量 set-image 封装。
+        predictor.reset_predictor()
+        predictor._orig_hw = orig_hws
+
+        can_stack_images = (
+            len({image.shape for image in images}) == 1
+            and all(image.dtype == np.uint8 for image in images)
+            and hasattr(predictor._transforms, "transforms")
+        )
+        if can_stack_images:
+            img_batch = torch.as_tensor(np.stack(images, axis=0))
+            img_batch = img_batch.permute(0, 3, 1, 2).contiguous().float()
+            img_batch = predictor._transforms.transforms(img_batch.div_(255.0))
+            img_batch = img_batch.to(predictor.device)
+        else:
+            img_batch = predictor._transforms.forward_batch(images).to(
+                predictor.device
+            )
+        assert (
+            len(img_batch.shape) == 4 and img_batch.shape[1] == 3
+        ), f"img_batch must be of size Bx3xHxW, got {img_batch.shape}"
+
+        backbone_out = predictor.model.forward_image(img_batch)
+        _, vision_feats, _, feat_sizes = (
+            predictor.model._prepare_backbone_features(backbone_out)
+        )
+        if predictor.model.directly_add_no_mem_embed:
+            vision_feats[-1] = vision_feats[-1] + predictor.model.no_mem_embed
+
+        feats = [
+            feat.permute(1, 2, 0).view(num_images, -1, *feat_size)
+            for feat, feat_size in zip(vision_feats[::-1], feat_sizes[::-1])
+        ][::-1]
+        predictor._features = {
+            "image_embed": feats[-1],
+            "high_res_feats": feats[:-1],
+        }
+        predictor._is_image_set = True
+        predictor._is_batch = True
+
+        if num_prompts == 0:
+            return [
+                (
+                    combined_masks_by_hw[orig_hws[i]][image_group_positions[i]],
+                    [],
+                    [],
+                )
+                for i in range(num_images)
+            ]
+
+        if prompt_batch_size is None or prompt_batch_size <= 0:
+            prompt_batch_size = num_prompts
+
+        image_embeddings_all = predictor._features["image_embed"]
+        high_res_features_all = predictor._features["high_res_feats"]
+        dense_pe = predictor.model.sam_prompt_encoder.get_dense_pe()
+        mask_input_size = predictor.model.sam_prompt_encoder.mask_input_size
+
+        # 2. 全局 prompt batch：两阶段处理。
+        #    Phase 1: 在 CPU 上预构建所有 mask tensor + 元数据（GPU 空闲一次性完成）
+        #    Phase 2: 紧凑 GPU 循环（最小化 GPU 间隙）
+        for orig_hw, prompt_records in prompt_records_by_hw.items():
+            if not prompt_records:
+                continue
+
+            h_img, w_img = orig_hw
+            group_size = len(image_groups[orig_hw])
+            combined_masks = combined_masks_by_hw[orig_hw]
+            score_maps = score_maps_by_hw[orig_hw]
+
+            # ── Phase 1: Pre-build all mask tensors at low resolution ──
+            # Build at mask_input_size (256×256) directly instead of full
+            # resolution (512×512) + F.interpolate → 4x less allocation.
+            mask_h, mask_w = mask_input_size
+            scale_h = mask_h / h_img
+            scale_w = mask_w / w_img
+
+            prebuild: list[tuple] = []
+            for batch_start in range(0, len(prompt_records), prompt_batch_size):
+                batch = prompt_records[batch_start:batch_start + prompt_batch_size]
+                batch_len = len(batch)
+
+                batch_img_indices = np.fromiter(
+                    (item[0] for item in batch), dtype=np.int64, count=batch_len
+                )
+                batch_group_indices = image_group_positions[batch_img_indices]
+                batch_inst_ids = np.fromiter(
+                    (item[1] + 1 for item in batch), dtype=np.int64, count=batch_len
+                )
+
+                batch_clusters = [
+                    np.asarray(item[2], dtype=np.int64).reshape(-1, 2)
+                    for item in batch
+                ]
+                cluster_lengths = np.fromiter(
+                    (len(cluster) for cluster in batch_clusters),
+                    dtype=np.int64,
+                    count=batch_len,
+                )
+                full_masks = np.full(
+                    (batch_len, mask_h, mask_w), -5.0, dtype=np.float32
+                )
+                if cluster_lengths.sum() > 0:
+                    all_coords = np.concatenate(batch_clusters, axis=0)
+                    all_prompt_indices = np.repeat(
+                        np.arange(batch_len), cluster_lengths
+                    )
+                    rows = (all_coords[:, 0] * scale_h).astype(np.intp)
+                    cols = (all_coords[:, 1] * scale_w).astype(np.intp)
+                    valid = (
+                        (rows >= 0) & (rows < mask_h) &
+                        (cols >= 0) & (cols < mask_w)
+                    )
+                    full_masks[
+                        all_prompt_indices[valid], rows[valid], cols[valid]
+                    ] = 5.0
+
+                prebuild.append((
+                    batch_len, batch_img_indices, batch_group_indices,
+                    batch_inst_ids, full_masks,
+                ))
+
+            # ── Phase 2: Tight GPU loop (only GPU + minimal .cpu()) ──
+            gpu_results: list[tuple] = []   # collect for Phase 3
+            for (batch_len, batch_img_indices, batch_group_indices,
+                 batch_inst_ids, mask_np) in prebuild:
+
+                # Upload pre-built low-res mask (no F.interpolate needed)
+                mask_tensor = torch.as_tensor(
+                    mask_np, dtype=torch.float, device=predictor.device
+                ).unsqueeze(1)
+
+                sparse_embeddings, dense_embeddings = (
+                    predictor.model.sam_prompt_encoder(
+                        points=None,
+                        boxes=None,
+                        masks=mask_tensor,
+                    )
+                )
+
+                batch_img_indices_t = torch.as_tensor(
+                    batch_img_indices, dtype=torch.long, device=predictor.device
+                )
+                high_res_features = [
+                    feat_level.index_select(0, batch_img_indices_t)
+                    for feat_level in high_res_features_all
+                ]
+                low_res_masks, iou_predictions, _, _ = (
+                    predictor.model.sam_mask_decoder(
+                        image_embeddings=image_embeddings_all.index_select(
+                            0, batch_img_indices_t
+                        ),
+                        image_pe=dense_pe,
+                        sparse_prompt_embeddings=sparse_embeddings,
+                        dense_prompt_embeddings=dense_embeddings,
+                        multimask_output=True,
+                        repeat_image=False,
+                        high_res_features=high_res_features,
+                    )
+                )
+
+                # Select best mask on GPU, transfer only the best one.
+                # Old: (B,3) float + (B,3,H,W) float → 12x more data
+                # New: (B,) float + (B,H,W) bool
+                batch_range_t = torch.arange(
+                    batch_len, device=iou_predictions.device)
+                best_indices_t = iou_predictions.argmax(dim=1)
+                best_scores = (
+                    iou_predictions[batch_range_t, best_indices_t]
+                    .float().cpu().numpy()
+                )
+                masks_t = predictor._transforms.postprocess_masks(
+                    low_res_masks, orig_hw
+                )
+                best_masks = (
+                    (masks_t[batch_range_t, best_indices_t]
+                     > predictor.mask_threshold)
+                    .cpu().numpy()
+                )
+
+                del mask_tensor, sparse_embeddings, dense_embeddings
+                del low_res_masks, iou_predictions, masks_t
+
+                gpu_results.append((
+                    best_scores, best_masks,
+                    batch_img_indices, batch_group_indices, batch_inst_ids,
+                ))
+
+            # ── Phase 3: Single-pass numpy winner selection (CPU) ──
+            if gpu_results:
+                all_scores = np.concatenate(
+                    [r[0] for r in gpu_results])
+                all_masks = np.concatenate(
+                    [r[1] for r in gpu_results])
+                all_img_idx = np.concatenate(
+                    [r[2] for r in gpu_results])
+                all_grp_idx = np.concatenate(
+                    [r[3] for r in gpu_results])
+                all_inst_ids = np.concatenate(
+                    [r[4] for r in gpu_results])
+                del gpu_results
+
+                total = len(all_scores)
+                passed = (
+                    all_scores >= score_threshold
+                    if score_threshold > 0
+                    else np.ones(total, dtype=bool)
+                )
+
+                passed_pos = np.where(passed)[0]
+                filtered_pos = np.where(~passed)[0]
+                score_records.extend(zip(
+                    all_img_idx[passed_pos].tolist(),
+                    all_inst_ids[passed_pos].tolist(),
+                    all_scores[passed_pos].tolist(),
+                ))
+                filtered_records.extend(zip(
+                    all_img_idx[filtered_pos].tolist(),
+                    all_inst_ids[filtered_pos].tolist(),
+                    all_scores[filtered_pos].tolist(),
+                ))
+
+                candidate_scores = np.where(
+                    all_masks & passed[:, None, None],
+                    all_scores[:, None, None],
+                    -np.inf,
+                )
+                all_score_maps = np.full(
+                    (group_size, h_img, w_img), -np.inf, dtype=np.float32
+                )
+                np.maximum.at(
+                    all_score_maps, all_grp_idx, candidate_scores
+                )
+
+                image_best_scores = all_score_maps[all_grp_idx]
+                winner_ids_sparse = np.where(
+                    candidate_scores == image_best_scores,
+                    all_inst_ids[:, None, None],
+                    0,
+                )
+                all_winner_ids = np.zeros(
+                    (group_size, h_img, w_img), dtype=np.uint16
+                )
+                np.maximum.at(
+                    all_winner_ids, all_grp_idx, winner_ids_sparse
+                )
+
+                update = (
+                    np.isfinite(all_score_maps) &
+                    (all_score_maps > score_maps)
+                )
+                combined_masks[update] = all_winner_ids[update]
+                score_maps[update] = all_score_maps[update]
+
+    scores_lists = [[] for _ in range(num_images)]
+    filtered_lists = [[] for _ in range(num_images)]
+    for img_idx, inst_id, score in score_records:
+        scores_lists[img_idx].append((inst_id, score))
+    for img_idx, inst_id, score in filtered_records:
+        filtered_lists[img_idx].append((inst_id, score))
+
+    return [
+        (
+            combined_masks_by_hw[orig_hws[i]][image_group_positions[i]],
+            scores_lists[i],
+            filtered_lists[i],
+        )
+        for i in range(num_images)
+    ]
+
+
 def _save_grouped_step_results(save_dir: str, group_id: int, image: np.ndarray,
                                 merged_coords: np.ndarray, mask_input: np.ndarray,
                                 masks: np.ndarray, scores: np.ndarray,
@@ -566,18 +915,27 @@ def merge_connected_masks(instance_mask: np.ndarray, scores_list: list,
     # 查找连通组件
     num_labels, labels = cv2.connectedComponents(binary_mask)
 
-    # 构建连通组件到实例的映射，并记录面积信息
-    component_info = {}
-    for comp_id in range(1, num_labels):
-        comp_mask = labels == comp_id
-        area = int(np.sum(comp_mask))
-        instance_ids = np.unique(instance_mask[comp_mask])
-        instance_ids = instance_ids[instance_ids > 0]
-        if len(instance_ids) > 0:
-            component_info[comp_id] = {
-                'member_ids': list(instance_ids),
-                'area': area
-            }
+    # 构建连通组件到实例的映射，并记录面积信息（向量化）
+    # 用 bincount 一次算出所有组件面积
+    comp_areas = np.bincount(labels.ravel(), minlength=num_labels)  # (num_labels,)
+    # 构建 (comp_id, inst_id) 配对，批量提取每个组件包含的实例
+    flat_labels = labels.ravel()
+    flat_inst = instance_mask.ravel()
+    valid_px = flat_inst > 0  # 仅前景像素
+    if valid_px.any():
+        pairs = np.stack([flat_labels[valid_px], flat_inst[valid_px]], axis=1)  # (N, 2)
+        unique_pairs = np.unique(pairs, axis=0)  # 去重 (comp_id, inst_id) 配对
+        component_info = {}
+        for comp_id in range(1, num_labels):
+            mask = unique_pairs[:, 0] == comp_id
+            if mask.any():
+                member_ids = unique_pairs[mask, 1].tolist()
+                component_info[comp_id] = {
+                    'member_ids': member_ids,
+                    'area': int(comp_areas[comp_id])
+                }
+    else:
+        component_info = {}
     
     # 若提供了 debug_dir，准备可视化
     if debug_dir:
@@ -919,9 +1277,13 @@ def run_sam2_point_iterative(predictor, image: np.ndarray, cells_info: list,
 def run_sam2_segmentation_batch(predictor, image: np.ndarray, clusters: list,
                                  min_area: int = 10,
                                  set_image: bool = True, batch_size: int = 32,
-                                 score_threshold: float = 0.3) -> tuple:
+                                 score_threshold: float = 0.0) -> tuple:
     """
     批量版本的 SAM2 推理（mask_only 模式），一次处理多个 prompt 以提升速度。
+
+    与 run_sam2_segmentation 产出完全一致（IoU≈1.0），仅推理方式不同：
+    直接调用 prompt_encoder + mask_decoder，手动设 repeat_image=True
+    让 mask decoder 广播单张 image embedding 到 batch 维度。
 
     Args:
         predictor: SAM2ImagePredictor instance
@@ -939,110 +1301,125 @@ def run_sam2_segmentation_batch(predictor, image: np.ndarray, clusters: list,
     """
     if set_image:
         predictor.set_image(image)
-        
+
     h, w = image.shape[:2]
     combined_mask = np.zeros((h, w), dtype=np.uint8)
     score_map = np.zeros((h, w), dtype=np.float32)
     scores_list = []
     filtered_list = []
-    
+
     # 1. 过滤有效的 clusters
     valid_clusters = []
     for idx, cluster in enumerate(clusters):
         if len(cluster) >= min_area:
             valid_clusters.append((idx, cluster))
-    
+
     if len(valid_clusters) == 0:
         return combined_mask, scores_list, filtered_list
-    
+
     # 2. 分批处理
-    total_batches = (len(valid_clusters) + batch_size - 1) // batch_size
-    
-    for batch_idx in range(total_batches):
-        batch_start = batch_idx * batch_size
-        batch_end = min(batch_start + batch_size, len(valid_clusters))
-        batch = valid_clusters[batch_start:batch_end]
-        
-        # 准备批量输入
-        masks_list = []
-        original_indices = []
+    for batch_start in range(0, len(valid_clusters), batch_size):
+        batch = valid_clusters[batch_start:batch_start + batch_size]
 
-        for idx, cluster in batch:
-            mask_input = generate_mask_from_cluster(cluster, image.shape)
-            masks_list.append(mask_input)
-            original_indices.append(idx)
+        # 准备 mask prompt tensor: (B, 1, 256, 256) — 批量构建，无逐个 for 循环
+        B = len(batch)
+        h_img, w_img = image.shape[:2]
+        full_masks = np.full((B, h_img, w_img), -5.0, dtype=np.float32)
+        # 将所有 cluster 坐标拼接，用 batch_idx 区分所属 batch
+        all_coords = []
+        all_batch_idx = []
+        for i, (_, cluster) in enumerate(batch):
+            coords = cluster if np.issubdtype(cluster.dtype, np.integer) else cluster.astype(np.int64)
+            all_coords.append(coords)
+            all_batch_idx.append(np.full(len(coords), i, dtype=np.intp))
+        all_coords = np.concatenate(all_coords, axis=0)
+        all_batch_idx = np.concatenate(all_batch_idx)
+        rows = all_coords[:, 0].astype(np.intp)
+        cols = all_coords[:, 1].astype(np.intp)
+        valid = (rows >= 0) & (rows < h_img) & (cols >= 0) & (cols < w_img)
+        full_masks[all_batch_idx[valid], rows[valid], cols[valid]] = 5.0
+        # batch resize: (B, H, W) -> (B, 1, 256, 256)，使用 F.interpolate 代替逐张 cv2.resize
+        mask_tensor = torch.as_tensor(full_masks, dtype=torch.float, device=predictor.device)
+        mask_tensor = F.interpolate(mask_tensor.unsqueeze(1), size=(256, 256), mode='area')
 
-        try:
-            # 堆叠成批量 tensor
-            masks_batch = np.concatenate(masks_list, axis=0)  # (B, 256, 256)
-            masks_batch = masks_batch[:, np.newaxis, :, :]    # (B, 1, 256, 256)
+        # mask-only batch forward：直接调用 prompt_encoder + mask_decoder
+        sparse_embeddings, dense_embeddings = predictor.model.sam_prompt_encoder(
+            points=None,
+            boxes=None,
+            masks=mask_tensor,
+        )
 
-            all_masks, all_scores, _ = predictor.predict(
-                mask_input=masks_batch,
-                multimask_output=True
-            )
-            
-            # all_masks: (B, 3, H, W) 或 (3, H, W) 如果 B=1
-            # all_scores: (B, 3) 或 (3,) 如果 B=1
-            
-            # 确保维度正确
-            if len(all_masks.shape) == 3:
-                all_masks = all_masks[np.newaxis, :]
-                all_scores = all_scores[np.newaxis, :]
-            
-            # 3. 后处理每个结果
-            for i, orig_idx in enumerate(original_indices):
-                best_idx = int(np.argmax(all_scores[i]))
-                best_score = float(all_scores[i, best_idx])
-                best_mask = all_masks[i, best_idx].astype(bool)
-                mask_area = np.sum(best_mask)
-                
-                inst_id = orig_idx + 1
-                
-                # 置信度过滤
-                if best_score < score_threshold:
-                    print(f"      Instance {inst_id}: score={best_score:.4f}, area={mask_area} pixels [FILTERED: score<{score_threshold}]")
-                    filtered_list.append((inst_id, best_score))
-                    continue
+        high_res_features = [
+            feat_level[-1].unsqueeze(0)
+            for feat_level in predictor._features["high_res_feats"]
+        ]
+        low_res_masks, iou_predictions, _, _ = predictor.model.sam_mask_decoder(
+            image_embeddings=predictor._features["image_embed"][-1].unsqueeze(0),
+            image_pe=predictor.model.sam_prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=True,
+            repeat_image=True,
+            high_res_features=high_res_features,
+        )
 
-                # 置信度优先合并
-                overwrite_mask = best_mask & (best_score > score_map)
-                combined_mask[overwrite_mask] = inst_id
-                score_map[overwrite_mask] = best_score
+        # 后处理：upscale + threshold
+        all_masks = predictor._transforms.postprocess_masks(
+            low_res_masks, predictor._orig_hw[-1]
+        )
+        all_masks = all_masks > predictor.mask_threshold
 
-                scores_list.append((inst_id, best_score))
+        all_masks_np = all_masks.float().detach().cpu().numpy()
+        all_scores_np = iou_predictions.float().detach().cpu().numpy()
 
-                final_area = np.sum(combined_mask == inst_id)
-                print(f"      Instance {inst_id}: score={best_score:.4f}, area={mask_area} pixels [final: {final_area} pixels]")
-                
-        except Exception as e:
-            # 如果批量推理失败，回退到逐个处理
-            print(f"    Batch inference failed: {e}, falling back to sequential...")
-            for idx, cluster in batch:
-                try:
-                    mask_input = generate_mask_from_cluster(cluster, image.shape)
+        # 3. 后处理 — 向量化，无逐个 for 循环
+        batch_idx = np.arange(B)
+        orig_indices = np.array([orig_idx for orig_idx, _ in batch])
+        inst_ids = orig_indices + 1  # (B,)
 
-                    masks, scores, _ = predictor.predict(
-                        mask_input=mask_input,
-                        multimask_output=True
-                    )
+        # 每个样本选最佳 mask：(B,) best index, (B,) best score, (B, H, W) best masks
+        best_indices = np.argmax(all_scores_np, axis=1)  # (B,)
+        best_scores = all_scores_np[batch_idx, best_indices]  # (B,)
+        best_masks = all_masks_np[batch_idx, best_indices].astype(bool)  # (B, H, W)
+        mask_areas = best_masks.sum(axis=(1, 2))  # (B,)
 
-                    best_idx = int(np.argmax(scores))
-                    best_score = float(scores[best_idx])
-                    best_mask = masks[best_idx].astype(bool)
-                    mask_area = np.sum(best_mask)
-                    inst_id = idx + 1
+        # 置信度过滤：向量化分离 passed / filtered
+        passed = (best_scores >= score_threshold) if score_threshold > 0 else np.ones(B, dtype=bool)
 
-                    if best_score < score_threshold:
-                        filtered_list.append((inst_id, best_score))
-                        continue
-                    
-                    overwrite_mask = best_mask & (best_score > score_map)
-                    combined_mask[overwrite_mask] = inst_id
-                    score_map[overwrite_mask] = best_score
-                    scores_list.append((inst_id, best_score))
-                    
-                except Exception as e2:
-                    print(f"    SAM2 Error on cluster {idx}: {e2}")
-    
+        # 记录被过滤的（批量构建列表）
+        filtered_mask = ~passed
+        if filtered_mask.any():
+            f_ids = inst_ids[filtered_mask]
+            f_scores = best_scores[filtered_mask]
+            f_areas = mask_areas[filtered_mask]
+            filtered_list.extend(list(zip(f_ids.tolist(), f_scores.tolist())))
+            for fid, fs, fa in zip(f_ids, f_scores, f_areas):
+                print(f"      Instance {fid}: score={fs:.4f}, area={fa} pixels [FILTERED: score<{score_threshold}]")
+
+        # 置信度优先合并 — 使用 score volume 向量化
+        passed_idx = np.where(passed)[0]
+        if len(passed_idx) > 0:
+            p_masks = best_masks[passed_idx]      # (P, H, W)
+            p_scores = best_scores[passed_idx]    # (P,)
+            p_iids = inst_ids[passed_idx]         # (P,)
+
+            # 构建 score volume: 每个像素取覆盖它的 mask 中 score 最高的
+            score_vol = np.where(p_masks, p_scores[:, None, None], -np.inf)  # (P, H, W)
+            winner = np.argmax(score_vol, axis=0)  # (H, W) — 每个像素的最佳实例索引
+            winner_scores = np.take_along_axis(
+                score_vol, winner[np.newaxis, :, :], axis=0
+            )[0]  # (H, W)
+
+            # 仅更新：有 mask 覆盖 且 score > 已有 score_map 的像素
+            any_covered = p_masks.any(axis=0)  # (H, W)
+            update = any_covered & (winner_scores > score_map)
+            combined_mask[update] = p_iids[winner[update]]
+            score_map[update] = winner_scores[update]
+
+            # 记录 scores_list + 日志
+            scores_list.extend(list(zip(p_iids.tolist(), p_scores.tolist())))
+            for pi in passed_idx:
+                final_area = np.sum(combined_mask == inst_ids[pi])
+                print(f"      Instance {inst_ids[pi]}: score={best_scores[pi]:.4f}, area={mask_areas[pi]} pixels [final: {final_area} pixels]")
+
     return combined_mask, scores_list, filtered_list

@@ -9,9 +9,7 @@ wsi_reader.py — WSI (Whole Slide Image) 读取模块
 """
 
 import sys
-import time
 import numpy as np
-from typing import Optional
 
 try:
     from openslide import OpenSlide
@@ -31,9 +29,6 @@ class WSIReader:
     从 WSI 文件中按需读取 tile_size x tile_size 的区域，
     tile 之间以 stride = tile_size - overlap 为步长滑动。
     overlap > 0 时相邻 tile 有重叠，用于消除跨 tile 边界的分割断裂。
-
-    支持 preload 模式：一次性将整个 level 读入内存（numpy 数组），
-    后续 read_tile 变成纯内存切片操作，全程零 I/O。
     """
 
     def __init__(self, wsi_path: str, tile_size: int = 512,
@@ -65,9 +60,6 @@ class WSIReader:
         self.level_dimensions = self.slide.level_dimensions[self.level]  # (width, height)
         self.level_downsample = self.slide.level_downsamples[self.level]
         self.mpp = float(self.slide.properties.get('openslide.mpp-x', 0))
-
-        # preload 数据：None 表示未预载
-        self._preloaded_image: Optional[np.ndarray] = None
 
         print(f"  WSI opened: {wsi_path}")
         print(f"  Level {self.level}: {self.level_dimensions[0]}x{self.level_dimensions[1]} "
@@ -127,89 +119,6 @@ class WSIReader:
             'objective_power': props.get('openslide.objective-power', 'unknown'),
         }
 
-    @property
-    def is_preloaded(self) -> bool:
-        """是否已预载全图到内存。"""
-        return self._preloaded_image is not None
-
-    def preload(self, max_mem_gb: float = 100.0):
-        """
-        将整个 level 读入内存为 numpy RGB 数组。
-
-        采用分块读取策略：按行条带（strip）逐块读取并直接写入
-        预分配的 RGB 数组，避免产生巨大的 RGBA 中间对象。
-
-        峰值额外内存 ≈ strip_height × width × 4 bytes（单条 RGBA），
-        远小于整图 RGBA 的内存开销。
-
-        Args:
-            max_mem_gb: 允许的最大 RGB 数组内存（GB）。超过此值时
-                        打印警告并跳过预载，走按需读取。默认 100 GB。
-        """
-        if self._preloaded_image is not None:
-            print("  Already preloaded, skipping.")
-            return
-
-        width, height = self.level_dimensions
-        mem_gb = width * height * 3 / (1024 ** 3)
-
-        if mem_gb > max_mem_gb:
-            print(f"  WARNING: Preload would require {mem_gb:.1f} GB "
-                  f"(limit={max_mem_gb:.1f} GB). Skipping preload.")
-            print(f"  Tip: Use a lower --target-magnification (e.g. 20) "
-                  f"or increase limit with --preload-max-gb.")
-            return
-
-        print(f"  Preloading level {self.level} into memory "
-              f"({width}x{height}, estimated {mem_gb:.1f} GB)...")
-
-        t0 = time.time()
-
-        # 预分配目标 RGB 数组（仅 3 通道）
-        self._preloaded_image = np.empty((height, width, 3), dtype=np.uint8)
-
-        # 按行条带分块读取，每条最多 strip_height 行
-        # 控制每条 RGBA 临时对象 ≈ strip_height × width × 4 bytes
-        # strip_height=4096 时，200k 宽度下每条 RGBA ≈ 3.2 GB，很安全
-        strip_height = 4096
-        downsample = self.level_downsample
-        strips_done = 0
-        total_strips = (height + strip_height - 1) // strip_height
-
-        for y_start in range(0, height, strip_height):
-            h = min(strip_height, height - y_start)
-
-            # read_region 需要 level 0 坐标
-            x0_level0 = 0
-            y0_level0 = int(y_start * downsample)
-
-            region = self.slide.read_region(
-                (x0_level0, y0_level0), self.level, (width, h)
-            )
-
-            # RGBA → RGB，直接写入预分配数组，然后释放 region
-            strip_rgb = np.array(region)[:, :, :3]
-            self._preloaded_image[y_start:y_start + h, :, :] = strip_rgb
-            del region, strip_rgb
-
-            strips_done += 1
-            print(f"    Preloading: strip {strips_done}/{total_strips} "
-                  f"(rows {y_start}-{y_start + h - 1})", end='\r')
-
-        elapsed = time.time() - t0
-        actual_gb = self._preloaded_image.nbytes / (1024 ** 3)
-        print(f"\n  Preload complete: {actual_gb:.1f} GB in {elapsed:.1f}s "
-              f"(shape={self._preloaded_image.shape})")
-
-    def unload(self):
-        """释放预载的全图内存。"""
-        if self._preloaded_image is not None:
-            shape = self._preloaded_image.shape
-            gb = self._preloaded_image.nbytes / (1024 ** 3)
-            del self._preloaded_image
-            self._preloaded_image = None
-            print(f"  Unloaded preloaded image ({shape}, {gb:.1f} GB freed)")
-
     def enumerate_tiles(self) -> list[dict]:
         """
         生成所有 tile 坐标列表。
@@ -257,7 +166,6 @@ class WSIReader:
         """
         从 WSI 读取单个 tile，返回 PIL Image (RGB)。
 
-        如果已 preload，直接从内存数组切片（零 I/O）。
         边缘 tile 不足 tile_size 时用白色 (255,255,255) 填充。
 
         Args:
@@ -266,22 +174,9 @@ class WSIReader:
         Returns:
             PIL.Image.Image: RGB 图像，尺寸固定为 tile_size x tile_size
         """
-        x = tile_info['x']
-        y = tile_info['y']
         actual_w = tile_info['actual_w']
         actual_h = tile_info['actual_h']
 
-        if self._preloaded_image is not None:
-            # 从预载的 numpy 数组中切片 (H, W, 3)
-            tile_np = self._preloaded_image[y:y + actual_h, x:x + actual_w].copy()
-
-            if actual_w < self.tile_size or actual_h < self.tile_size:
-                padded = np.full((self.tile_size, self.tile_size, 3), 255, dtype=np.uint8)
-                padded[:actual_h, :actual_w] = tile_np
-                return Image.fromarray(padded)
-            return Image.fromarray(tile_np)
-
-        # 未 preload：走 OpenSlide read_region
         x_level0 = tile_info['x_level0']
         y_level0 = tile_info['y_level0']
 
@@ -305,28 +200,12 @@ class WSIReader:
         """
         读取 tile 并返回 numpy RGB 数组。
 
-        如果已 preload，直接从内存数组切片，跳过 PIL 转换。
-
         Args:
             tile_info: enumerate_tiles() 返回的单个 tile dict
 
         Returns:
             np.ndarray: RGB 数组 (H, W, 3)，dtype=uint8
         """
-        if self._preloaded_image is not None:
-            x = tile_info['x']
-            y = tile_info['y']
-            actual_w = tile_info['actual_w']
-            actual_h = tile_info['actual_h']
-
-            tile_np = self._preloaded_image[y:y + actual_h, x:x + actual_w].copy()
-
-            if actual_w < self.tile_size or actual_h < self.tile_size:
-                padded = np.full((self.tile_size, self.tile_size, 3), 255, dtype=np.uint8)
-                padded[:actual_h, :actual_w] = tile_np
-                return padded
-            return tile_np
-
         return np.array(self.read_tile(tile_info))
 
     def get_tile_filename(self, tile_info: dict) -> str:
@@ -362,8 +241,7 @@ class WSIReader:
         return self.get_tile_filename(tile_info)
 
     def close(self):
-        """关闭 OpenSlide 句柄并释放预载内存。"""
-        self.unload()
+        """关闭 OpenSlide 句柄。"""
         if hasattr(self, 'slide') and self.slide is not None:
             self.slide.close()
             self.slide = None

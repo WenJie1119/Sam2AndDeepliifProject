@@ -87,16 +87,16 @@ def compute_posneg_mask(seg_array: np.ndarray,
     return posneg_mask, is_foreground, rb_diff
 
 
-def compute_marker_threshold(marker_gray: np.ndarray, 
+def compute_marker_threshold(marker_gray: np.ndarray,
                              percentile_factor: float = 0.9) -> int:
     """
     自动计算 Marker 阈值。
     
-    使用非零像素的 0.1%-99.9% 范围，取 90% 分位作为阈值。
+    使用非零像素的 0.1%-99.9% 范围，根据 percentile_factor 取范围内位置。
     
     Args:
         marker_gray: 灰度 Marker 图像
-        percentile_factor: 阈值在范围内的位置 (默认 0.9 = 90%)
+        percentile_factor: 阈值在范围内的位置 (默认 0.9 = 接近高端)
         
     Returns:
         计算得到的 Marker 阈值 (整数)
@@ -412,15 +412,16 @@ def group_cells_by_distance(cells_info: list[dict],
         if px != py:
             parent[px] = py
     
-    # 计算每对细胞中心点之间的距离，距离小于阈值则合并
-    for i in range(n):
-        center_i = cells_info[i]['center']
-        for j in range(i + 1, n):
-            center_j = cells_info[j]['center']
-            # 欧氏距离
-            dist = np.sqrt((center_i[0] - center_j[0])**2 + (center_i[1] - center_j[1])**2)
-            if dist < distance_threshold:
-                union(i, j)
+    # 计算每对细胞中心点之间的距离，距离小于阈值则合并（向量化）
+    centers = np.array([c['center'] for c in cells_info])  # (n, 2)
+    # 广播计算所有两两距离的平方，避免 O(n²) Python 循环
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]  # (n, n, 2)
+    dist_sq = np.sum(diffs ** 2, axis=2)  # (n, n)
+    # 取上三角 (i < j) 中距离小于阈值的配对
+    threshold_sq = distance_threshold ** 2
+    pairs_i, pairs_j = np.where(np.triu(dist_sq < threshold_sq, k=1))
+    for i, j in zip(pairs_i, pairs_j):
+        union(int(i), int(j))
     
     # 根据 Union-Find 结果分组
     groups = {}
@@ -635,6 +636,7 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
                                         marker_array: np.ndarray,
                                         seg_thresh: int = 120,
                                         marker_thresh: Optional[int] = None,
+                                        marker_percentile_factor: float = 0.9,
                                         morphology_kernel: int = 11,
                                         min_area: int = 200,
                                         debug_dir: Optional[str] = None) -> list:
@@ -650,16 +652,18 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
     流程：
     1. 从 Seg 提取前景像素: (R+B > seg_thresh) && (G <= 80)
     2. 在前景中，用 Seg 判断阳性像素: R >= B
-    3. 在阳性像素中，用 Marker 增强确认: marker > marker_thresh 的也标为阳性
-    4. 形态学闭运算：连接相邻的阳性像素（关键步骤！）
-    5. 形态学开运算：去除小噪点
-    6. 8-连通组件分析：提取每个连通区域作为整体
+    3. 在前景中，用 Marker 阈值确认阳性像素: marker > marker_thresh
+    4. Seg 阳性和 Marker 阳性取交集，作为最终阳性像素
+    5. 形态学闭运算：连接相邻的阳性像素（关键步骤！）
+    6. 形态学开运算：去除小噪点
+    7. 8-连通组件分析：提取每个连通区域作为整体
 
     Args:
         seg_array: DeepLIIF Seg 输出的 RGB 数组
         marker_array: DeepLIIF Marker 输出（灰度或RGB）
         seg_thresh: Seg 前景检测阈值 (默认120)
         marker_thresh: Marker 阳性阈值。None = 自动计算
+        marker_percentile_factor: 自动 Marker 阈值在 0.1%-99.9% 范围内的位置
         morphology_kernel: 形态学闭运算核大小，越大连接性越强
                           推荐值: 7-15 (默认11)
         min_area: 最小区域面积（像素数），过滤小碎片 (默认200)
@@ -684,8 +688,10 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
 
     # 自动计算 marker 阈值
     if marker_thresh is None:
-        marker_thresh = compute_marker_threshold(marker_gray)
-        print(f"    [Connected Region] Auto marker_thresh: {marker_thresh}")
+        marker_thresh = compute_marker_threshold(
+            marker_gray, percentile_factor=marker_percentile_factor)
+        print(f"    [Connected Region] Auto marker_thresh: {marker_thresh} "
+              f"(percentile_factor={marker_percentile_factor})")
 
     # 用于保存 debug 图片的辅助函数
     def _save_debug(name, img):
@@ -709,7 +715,7 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
         posneg_vis[posneg_mask == 1] = [0, 0, 255]    # 阴性=蓝
         _save_debug("cr_step1_posneg_mask.png", posneg_vis)
 
-    # === Step 2: 确定阳性像素（Seg阳性 OR Marker强阳性） ===
+    # === Step 2: 确定阳性像素（Seg阳性 AND Marker阳性） ===
     # Seg 判断的阳性: posneg_mask == 2 (即 R >= B 的前景像素)
     seg_positive = (posneg_mask == 2)
 
@@ -721,20 +727,22 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
         seg_pos_vis = np.zeros((*seg_array.shape[:2], 3), dtype=np.uint8)
         seg_pos_vis[seg_positive] = [0, 255, 0]
         _save_debug("cr_step2a_seg_positive.png", seg_pos_vis)
-        # Marker 增强的像素（黄色=仅Marker增强, 绿色=Seg已有）
+        # Marker 对比图：绿=交集，黄=仅Marker，红=仅Seg
         marker_vis = np.zeros((*seg_array.shape[:2], 3), dtype=np.uint8)
-        marker_vis[seg_positive] = [0, 255, 0]
+        marker_vis[seg_positive & ~marker_positive] = [255, 0, 0]
         marker_vis[marker_positive & ~seg_positive] = [255, 255, 0]
+        marker_vis[seg_positive & marker_positive] = [0, 255, 0]
         _save_debug("cr_step2b_marker_enhanced.png", marker_vis)
 
-    # 联合: 两者取并集
-    positive_pixels = (seg_positive | marker_positive).astype(np.uint8) * 255
+    # 联合: 两者取交集
+    positive_pixels = (seg_positive & marker_positive).astype(np.uint8) * 255
 
     if debug_dir is not None:
         _save_debug("cr_step2c_combined_positive.png", positive_pixels)
 
     print(f"    [Connected Region] Seg positive pixels: {np.sum(seg_positive)}, "
-          f"Marker enhanced: {np.sum(marker_positive & ~seg_positive)}, "
+          f"Marker positive: {np.sum(marker_positive)}, "
+          f"Intersection: {np.sum(seg_positive & marker_positive)}, "
           f"Total: {np.sum(positive_pixels > 0)}")
 
     # === Step 3: 形态学闭运算 — 连接相邻阳性像素 ===

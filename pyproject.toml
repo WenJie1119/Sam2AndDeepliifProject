@@ -35,7 +35,7 @@ dev = [
 ]
 
 [project.scripts]
-cd34-pipeline = "scripts.run_pipeline:main"
+cd34-pipeline = "cell.main:main"
 
 [tool.setuptools.packages.find]
-include = ["cd34_pipeline*", "scripts"]
+include = ["cd34_pipeline*", "cell", "scripts"]

@@ -313,14 +313,19 @@ def save_cell_groups_csv(cell_groups: list, output_dir: str, base_name: str,
             member_ids_str = ';'.join(map(str, group['member_ids']))
             center_y, center_x = group['center']
 
-            member_distances = []
             member_cells = group['member_cells']
-            for i in range(len(member_cells)):
-                for j in range(i + 1, len(member_cells)):
-                    c1 = member_cells[i]['center']
-                    c2 = member_cells[j]['center']
-                    dist = np.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)
-                    member_distances.append(f"{member_cells[i]['id']}-{member_cells[j]['id']}:{dist:.1f}")
+            n_members = len(member_cells)
+            if n_members > 1:
+                centers = np.array([c['center'] for c in member_cells])  # (n, 2)
+                cell_ids = [c['id'] for c in member_cells]
+                # 向量化两两距离计算
+                diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]  # (n, n, 2)
+                dists = np.sqrt(np.sum(diffs ** 2, axis=2))  # (n, n)
+                pi, pj = np.triu_indices(n_members, k=1)
+                member_distances = [f"{cell_ids[i]}-{cell_ids[j]}:{dists[i, j]:.1f}"
+                                    for i, j in zip(pi, pj)]
+            else:
+                member_distances = []
 
             distances_str = ';'.join(member_distances) if member_distances else 'single_cell'
             f.write(f"{group['group_id']},{len(group['member_ids'])},\"{member_ids_str}\",{group['total_pixels']},{center_y},{center_x},{distance_threshold},\"{distances_str}\"\n")

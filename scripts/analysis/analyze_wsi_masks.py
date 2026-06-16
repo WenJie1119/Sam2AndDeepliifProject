@@ -30,6 +30,16 @@ Usage:
     python scripts/analysis/analyze_wsi_masks.py locate \
         --x 11000.5 --y 2300.0 --mpp 0.2264 \
         --npy-dir /path/to/npy_masks
+
+    # 仅根据 WSI 和 µm 坐标计算 tile-index（不需要已有 npy）
+    python scripts/analysis/analyze_wsi_masks.py locate \
+        --x 11000.5 --y 2300.0 --wsi /path/to/slide.ndpi
+
+    # 按主 pipeline 的 ROI tile grid 计算 tile-index
+    python scripts/analysis/analyze_wsi_masks.py locate \
+        --x 11000.5 --y 2300.0 \
+        --wsi /path/to/slide.ndpi \
+        --roi-json /path/to/roi.json
 """
 
 import argparse
@@ -889,9 +899,13 @@ def cmd_optimize_geojson(args):
 # ── locate 子命令 ─────────────────────────────────────────────
 
 def cmd_locate(args):
-    """根据 µm 坐标定位 tile，返回对应的图像文件名。"""
+    """根据 µm 坐标定位 tile，返回 tile-index 或对应的图像文件名。"""
     tile_size = args.tile_size
     x_um, y_um = args.x, args.y
+
+    if not args.npy_dir and not args.wsi:
+        print("Error: 不传 --npy-dir 时必须指定 --wsi，用于枚举 tile")
+        sys.exit(1)
 
     # µm → pixel 换算
     mpp = args.mpp
@@ -919,25 +933,83 @@ def cmd_locate(args):
     print(f"Input (µm): ({x_um}, {y_um}),  mpp={mpp}")
     print(f"  → pixel: ({px}, {py})")
 
-    # 扫描所有 npy 文件，用文件名中的实际像素偏移量匹配
-    npy_dir = Path(args.npy_dir)
+    # 如果给了 npy-dir，扫描已有 mask 文件，用文件名中的像素偏移量匹配。
+    if args.npy_dir:
+        npy_dir = Path(args.npy_dir)
+        matches = []
+        for npy_path in npy_dir.glob("*.npy"):
+            parsed = parse_tile_filename(npy_path.name)
+            if not parsed:
+                continue
+            row, col, x_off, y_off = parsed
+            if x_off is None or y_off is None:
+                continue
+            if x_off <= px < x_off + tile_size and y_off <= py < y_off + tile_size:
+                matches.append((row, col, npy_path.name))
+
+        if matches:
+            for row, col, filename in matches:
+                print(f"  → tile (row={row}, col={col})")
+                print(f"  → --tile-index {row},{col}")
+                print(f"  → 文件名: {filename}")
+        else:
+            print(f"  → 未找到对应的 tile 文件")
+        return
+
+    # 没有 npy-dir 时，直接根据 WSIReader 的 tile 网格计算 tile-index。
+    from cd34_pipeline.io.wsi_reader import WSIReader
+
+    reader = WSIReader(
+        args.wsi,
+        tile_size=tile_size,
+        target_magnification=args.magnification,
+        overlap=args.overlap,
+    )
+
+    if args.roi_json:
+        from cell.utils import (
+            apply_crop_region_slice,
+            enumerate_tiles_in_roi,
+            load_roi_json,
+        )
+
+        roi_data = load_roi_json(args.roi_json)
+        crop_region = apply_crop_region_slice(
+            roi_data['crop_region'], args.crop_region_slice)
+        tiles = enumerate_tiles_in_roi(
+            crop_region=crop_region,
+            roi_polygon=roi_data['roi_polygon'],
+            tile_size=tile_size,
+            overlap=args.overlap,
+            level_downsample=reader.level_downsample,
+        )
+        grid_name = "ROI pipeline grid"
+    else:
+        tiles = reader.enumerate_tiles()
+        grid_name = "global WSI grid"
+
     matches = []
-    for npy_path in npy_dir.glob("*.npy"):
-        parsed = parse_tile_filename(npy_path.name)
-        if not parsed:
-            continue
-        row, col, x_off, y_off = parsed
-        if x_off is None or y_off is None:
-            continue
-        if x_off <= px < x_off + tile_size and y_off <= py < y_off + tile_size:
-            matches.append((row, col, npy_path.name))
+    for tile in tiles:
+        x0 = tile['x_level0']
+        y0 = tile['y_level0']
+        x1 = x0 + int(round(tile['actual_w'] * reader.level_downsample))
+        y1 = y0 + int(round(tile['actual_h'] * reader.level_downsample))
+        if x0 <= px < x1 and y0 <= py < y1:
+            matches.append((tile, x0, y0, x1, y1))
 
     if matches:
-        for row, col, filename in matches:
-            print(f"  → tile (row={row}, col={col})")
-            print(f"  → 文件名: {filename}")
+        print(f"  WSI level: {reader.level}, magnification={reader.actual_magnification:.1f}x, "
+              f"downsample={reader.level_downsample:.2f}")
+        print(f"  grid: {grid_name}")
+        print(f"  tile-size={tile_size}, overlap={args.overlap}, stride={reader.stride}")
+        for tile, x0, y0, x1, y1 in matches:
+            print(f"  → tile (row={tile['row']}, col={tile['col']})")
+            print(f"  → --tile-index {tile['row']},{tile['col']}")
+            print(f"  → bbox_px: ({x0},{y0})-({x1},{y1})")
     else:
-        print(f"  → 未找到对应的 tile 文件")
+        print("  → 未找到覆盖该坐标的 tile")
+
+    reader.close()
 
 
 # ── main ──────────────────────────────────────────────────────
@@ -970,7 +1042,7 @@ def main():
 
     # locate
     p_loc = sub.add_parser('locate',
-        help='Locate tile by µm coordinate, return image filename')
+        help='Locate tile by µm coordinate, return tile-index or image filename')
     p_loc.add_argument('--x', type=float, required=True,
         help='X coordinate in µm')
     p_loc.add_argument('--y', type=float, required=True,
@@ -979,9 +1051,18 @@ def main():
         help='Microns per pixel (e.g. 0.2264). Auto-read from WSI if --wsi is given')
     p_loc.add_argument('--wsi', type=str, default=None,
         help='Path to WSI file (.ndpi/.svs) to auto-read mpp')
-    p_loc.add_argument('--npy-dir', required=True,
-        help='npy_masks directory for locating tile files')
+    p_loc.add_argument('--npy-dir',
+        help='Optional npy_masks directory for locating existing tile files')
+    p_loc.add_argument('--roi-json',
+        help='Optional ROI JSON. If given without --npy-dir, use the same ROI tile grid as the main pipeline')
+    p_loc.add_argument('--crop-region-slice', default=None,
+        help='Same as main pipeline --crop-region-slice, used only with --roi-json '
+             '(e.g. top:1/4,left:1/3)')
     p_loc.add_argument('--tile-size', type=int, default=512)
+    p_loc.add_argument('--overlap', type=int, default=128,
+        help='Tile overlap used by the pipeline when --npy-dir is omitted (default: 128)')
+    p_loc.add_argument('--magnification', type=float, default=40.0,
+        help='Target magnification used by the pipeline when --npy-dir is omitted (default: 40.0)')
 
     # export-geojson
     p_geo = sub.add_parser('export-geojson',

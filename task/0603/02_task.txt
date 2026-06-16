@@ -1,0 +1,2 @@
+debug_outputs/sample_output_top1_4_left1_3/DC2200155 A3 CD34.geojson和debug_output/debug_roi_region_812-7066-8253-7054-8274-7289-8125-7278/DC2200155 A3 CD34.geojson 还是不一致
+范围还是这个区域--debug-region-um 8121,7066,8253,7054,8274,7289,8125,7278 请分析问题出现在哪里

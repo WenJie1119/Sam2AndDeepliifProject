@@ -32,7 +32,11 @@ deepliif_models/*.pt
 # Data & output
 data/input/
 data/output/
+data/CD34InputData/
 test_results/
+debug_output/
+debug_outputs/
+test_notebook/
 
 # Images (typically large, not tracked)
 *.jpg

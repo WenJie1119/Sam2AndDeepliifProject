@@ -32,6 +32,7 @@ cluster = [
 dev = [
     "pytest",
     "ruff",
+    "shapely>=2.0",
 ]
 
 [project.scripts]
@@ -39,3 +40,6 @@ cd34-pipeline = "cell.main:main"
 
 [tool.setuptools.packages.find]
 include = ["cd34_pipeline*", "cell", "scripts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

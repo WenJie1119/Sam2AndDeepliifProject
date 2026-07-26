@@ -7,36 +7,35 @@
 ```
 cd34-microvessel-detection/
 ├── pyproject.toml              # 项目依赖与构建配置
-├── configs/
-│   └── default.yaml            # 默认参数配置
+├── config/
+│   └── cell_main.json          # 当前主流程默认配置
 │
-├── cd34_pipeline/              # 核心包
-│   ├── config.py               # 命令行参数解析
-│   ├── pipeline.py             # 主流程编排
+├── cell/                       # 正式 WSI Pipeline 入口与运行编排
+│   ├── main.py                 # Producer-Consumer 主流程
+│   ├── deepliif.py             # DeepLIIF 批处理封装
+│   ├── sam2.py                 # SAM2 批处理封装
+│   └── postprocess.py          # 拼接、后处理与导出
+│
+├── cd34_pipeline/              # 底层算法、模型与 I/O
 │   ├── deepliif/               # DeepLIIF 推理与后处理
-│   ├── sam2_wrapper/           # SAM2 模型加载与推理
+│   ├── sam2_wrapper/           # SAM2 加载、推理与 weighted prompt
 │   ├── cell/                   # 细胞提取、分类、掩码操作
-│   ├── io/                     # 文件读写、LabelMe 导出、GeoJSON 导出
+│   ├── io/                     # WSI 读取、拼接与 GeoJSON 导出
 │   └── visualization/          # 可视化与对比图
 │
-├── scripts/                    # 入口脚本与工具
-│   ├── pipeline/
-│   │   ├── run_wsi_pipeline.py # WSI pipeline 入口
-│   │   └── run_deepliif_only.py# DeepLIIF 独立测试
-│   ├── analysis/
-│   │   ├── analyze_wsi_masks.py
-│   │   ├── visualize_reconstructed.py
-│   │   └── generate_ppt.py
-│   └── experimental/
-│       ├── merge_tiles_demo.py
-│       ├── test_interactive_sam2.py
-│       ├── test_mask_only.py
-│       └── visualize_results.py
+├── scripts/
+│   ├── pipeline/               # 独立的稳定运行工具
+│   ├── analysis/               # 结果分析与报告生成
+│   ├── annotation/             # 标注格式转换
+│   └── experimental/           # 单图、局部算法实验（非正式入口）
 │
-├── docs/                       # 文档
-│   └── parameters.md           # 参数详细说明
+├── tests/                      # 正式单元测试
+├── docs/
+│   ├── architecture.md         # 当前架构说明
+│   ├── parameters.md           # 参数详细说明
+│   └── reports/                # 阶段报告与演示文稿
 │
-└── data/                       # 数据目录 (gitignored)
+└── data/                       # 数据目录（gitignored）
     ├── models/
     │   ├── deepliif/           # DeepLIIF 模型权重 (G1-G55.pt)
     │   └── sam2/               # SAM2 checkpoints
@@ -78,10 +77,11 @@ pip install -e ".[tile]"
 ## 使用
 
 ```bash
-# 完整 pipeline
-python scripts/pipeline/run_wsi_pipeline.py \
-    --wsi-path data/input/slide.ndpi \
-    --output-dir data/output
+# 正式完整 WSI Pipeline（默认读取 config/cell_main.json）
+python -m cell.main
+
+# 安装项目后也可以使用命令入口
+cd34-pipeline
 
 # 仅运行 DeepLIIF
 python scripts/pipeline/run_deepliif_only.py --img data/input/sample.png
@@ -90,12 +90,13 @@ python scripts/pipeline/run_deepliif_only.py --img data/input/sample.png
 区域验证：
 
 ```bash
-# 默认读取 config/cell_main.json
-python -m cell.main
-
-# 也可以临时覆盖 config 中的字段
+# 命令行参数会覆盖配置文件中的同名字段
 python -m cell.main --weighted-dab-min-intensity 125
 ```
+
+当前只有一套正式的完整 WSI Pipeline。`cell/` 负责入口和流程编排，
+并调用 `cd34_pipeline/` 中的 DeepLIIF、SAM2、weighted prompt、WSI I/O
+及 GeoJSON 导出功能。`scripts/experimental/` 中的脚本仅用于局部实验和调试。
 
 ## 参数说明
 

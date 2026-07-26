@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 TEST_DIR = ROOT / "debug_output" / "test08"
 REGION_DIR = TEST_DIR / "debug_region"
 TILE_DIR = TEST_DIR / "debug_vis" / "tile_37_13_4992_14208"
-OUT_PPT = ROOT / "docs" / "CD34_test08_project_progress.pptx"
+OUT_PPT = ROOT / "docs" / "reports" / "CD34_test08_project_progress.pptx"
 
 SLIDE_W = Inches(13.333)
 SLIDE_H = Inches(7.5)

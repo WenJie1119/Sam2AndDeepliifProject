@@ -20,7 +20,11 @@ from typing import Optional
 import matplotlib.pyplot as plt
 
 # 导入共享辅助函数，确保和 extract_cells_from_seg 使用相同逻辑
-from cd34_pipeline.cell.extraction import compute_posneg_mask, compute_marker_threshold
+from cd34_pipeline.cell.extraction import (
+    compute_positive_masks,
+    compute_marker_threshold,
+    compute_posneg_mask,
+)
 
 
 # ============================================================================
@@ -447,7 +451,7 @@ def save_connected_region_visualization(seg_array: np.ndarray,
         Step 1: Seg 前景提取
         Step 2: Seg 阳性像素 (R >= B)
         Step 3: Marker 阈值阳性像素
-        Step 4: 联合阳性像素 (Seg & Marker)
+        Step 4: 联合阳性像素 (Seg | Marker)
         Step 5: 形态学闭运算（连接近邻像素）
         Step 6: 最终连通区域 + SAM2 Prompts
         + Summary 汇总图
@@ -457,18 +461,19 @@ def save_connected_region_visualization(seg_array: np.ndarray,
     print(f"  > [Connected Region] Saving pipeline visualization to {vis_dir}/")
 
     # ========== 准备数据 ==========
-    if marker_array.ndim == 3:
-        marker_gray = cv2.cvtColor(marker_array, cv2.COLOR_RGB2GRAY)
-    else:
-        marker_gray = marker_array.copy()
-
     h, w = seg_array.shape[:2]
-
-    posneg_mask, is_foreground, rb_diff = compute_posneg_mask(seg_array, seg_thresh)
-    is_pos_pixel = (posneg_mask == 2)
-
-    if marker_thresh is None:
-        marker_thresh = compute_marker_threshold(marker_gray)
+    masks = compute_positive_masks(
+        seg_array,
+        marker_array,
+        seg_thresh=seg_thresh,
+        marker_thresh=marker_thresh,
+    )
+    posneg_mask = masks["posneg_mask"]
+    is_foreground = masks["is_foreground"]
+    marker_gray = masks["marker_gray"]
+    marker_thresh = masks["marker_thresh"]
+    seg_positive = masks["seg_positive"]
+    marker_positive = masks["marker_positive"]
 
     # ========== Step 1: Seg 前景 ==========
     foreground_vis = (is_foreground * 255).astype(np.uint8)
@@ -476,13 +481,12 @@ def save_connected_region_visualization(seg_array: np.ndarray,
 
     # ========== Step 2: Seg 阳性像素 ==========
     seg_pos_vis = np.zeros((h, w, 3), dtype=np.uint8)
-    seg_pos_vis[is_foreground & is_pos_pixel] = [255, 0, 0]    # 红色 = 阳性
-    seg_pos_vis[is_foreground & ~is_pos_pixel] = [0, 0, 255]   # 蓝色 = 阴性
+    seg_pos_vis[seg_positive] = [255, 0, 0]                    # 红色 = 阳性
+    seg_pos_vis[is_foreground & ~seg_positive] = [0, 0, 255]  # 蓝色 = 未保留
     cv2.imwrite(os.path.join(vis_dir, "step2_seg_positive_pixels.png"),
                 cv2.cvtColor(seg_pos_vis, cv2.COLOR_RGB2BGR))
 
     # ========== Step 3: Marker 阈值阳性 ==========
-    marker_positive = is_foreground & (marker_gray > marker_thresh)
     marker_enhance_vis = np.zeros((h, w, 3), dtype=np.uint8)
     marker_enhance_vis[marker_positive] = [255, 165, 0]  # 橙色 = Marker阳性
     cv2.imwrite(os.path.join(vis_dir, "step3_marker_enhanced_pixels.png"),
@@ -499,12 +503,11 @@ def save_connected_region_visualization(seg_array: np.ndarray,
     plt.close()
 
     # ========== Step 4: 联合阳性像素 ==========
-    seg_positive = (posneg_mask == 2)
-    combined_positive = seg_positive & marker_positive
+    combined_positive = masks["combined_positive"]
     combined_vis = np.zeros((h, w, 3), dtype=np.uint8)
-    # Seg 独有: 红色，仅作为诊断，不进入 combined_positive
+    # Seg 独有: 红色，进入 combined_positive
     seg_only = seg_positive & ~marker_positive
-    # Marker 独有: 橙色，仅作为诊断，不进入 combined_positive
+    # Marker 独有: 橙色，作为 Seg 补充进入 combined_positive
     marker_only = marker_positive & ~seg_positive
     # 两者都有: 黄色，进入 combined_positive
     both = seg_positive & marker_positive
@@ -587,7 +590,7 @@ def save_connected_region_visualization(seg_array: np.ndarray,
     axes[0, 1].axis('off')
 
     axes[0, 2].imshow(seg_pos_vis)
-    axes[0, 2].set_title(f'3. Seg Positive (R>=B)', fontsize=11)
+    axes[0, 2].set_title('3. Seg Positive (R>=B)', fontsize=11)
     axes[0, 2].axis('off')
 
     axes[0, 3].imshow(marker_gray, cmap='hot')
@@ -596,7 +599,7 @@ def save_connected_region_visualization(seg_array: np.ndarray,
 
     # Row 2: 连接过程
     axes[1, 0].imshow(combined_vis)
-    axes[1, 0].set_title(f'5. Intersection (Seg&Marker)\n'
+    axes[1, 0].set_title(f'5. Union (Seg OR Marker)\n'
                          f'Red=Seg only, Orange=Marker only, Yellow=Both', fontsize=10)
     axes[1, 0].axis('off')
 

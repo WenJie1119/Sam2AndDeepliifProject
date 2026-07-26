@@ -67,12 +67,16 @@ class Bucket:
 
 @dataclass
 class BucketItem:
-    """Minimal payload for the SAM2 consumer."""
+    """Minimal weighted-prompt payload for the SAM2 consumer."""
     tile_np: np.ndarray         # RGB image (H, W, 3)
-    clusters: list              # list of (N,2) coord arrays
     positive_cells_info: list   # cell dicts for merge_connected_masks
     tile_info: dict             # WSI tile position info
     tile_name: str              # e.g. "tile_5_12_5632_2048"
+    mask_input: Optional[np.ndarray] = None
+    point_coords: Optional[np.ndarray] = None
+    point_labels: Optional[np.ndarray] = None
+    prompt_stats: Optional[dict] = None
+    prompt_debug_dir: Optional[str] = None
 
 
 # ============================================================================

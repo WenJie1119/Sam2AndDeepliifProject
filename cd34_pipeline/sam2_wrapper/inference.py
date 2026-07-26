@@ -29,10 +29,10 @@ def run_sam2_segmentation(predictor, image: np.ndarray, clusters: list,
         predictor: SAM2ImagePredictor 实例
         image: RGB 图像数组
         clusters: 候选区域坐标列表，每个元素是一个 (N, 2) 的坐标数组
-        min_area: 最小候选区域面积，低于此值的 cluster 会被跳过
+        min_area: 送入 SAM 前的最小 cluster 面积
         set_image: 是否调用 predictor.set_image() 对图像进行编码
         score_threshold: 最低置信度阈值，低于此分数的结果会被过滤（0.0 表��不过滤）
-        debug_dir: 若提供路径，则保存每个实例的中间结果用于调试（由 --debug-vis 统一控制）
+        debug_dir: 若提供路径，则保存每个实例的中间结果用于区域调试
 
     Returns:
         combined_mask: 实例分割掩码，每个像素值为对应的实例 ID
@@ -46,7 +46,7 @@ def run_sam2_segmentation(predictor, image: np.ndarray, clusters: list,
         predictor.set_image(image)
 
     h, w = image.shape[:2]
-    combined_mask = np.zeros((h, w), dtype=np.uint8)   # 实例分割结果掩码
+    combined_mask = np.zeros((h, w), dtype=np.uint16)  # 实例分割结果掩码
     score_map = np.zeros((h, w), dtype=np.float32)      # 每个像素对应的最高置信度
     scores_list = []    # 保留的实例及其分数
     filtered_list = []  # 被过滤的实例及其分数
@@ -59,7 +59,6 @@ def run_sam2_segmentation(predictor, image: np.ndarray, clusters: list,
 
     # 逐个处理每个候选区域
     for idx, cluster in enumerate(clusters):
-        # 跳过面积过小的候选区域
         if len(cluster) < min_area:
             continue
 
@@ -148,7 +147,7 @@ def run_sam2_grouped_segmentation(predictor, image: np.ndarray, cell_groups: lis
         min_area: Minimum area threshold
         set_image: Whether to call predictor.set_image()
         score_threshold: Minimum score threshold for filtering
-        debug_dir: If provided, save intermediate results (controlled by --debug-vis)
+        debug_dir: If provided, save intermediate results for region debugging.
 
     Returns:
         combined_mask: Instance segmentation mask (group_id for each pixel)
@@ -161,7 +160,7 @@ def run_sam2_grouped_segmentation(predictor, image: np.ndarray, cell_groups: lis
         predictor.set_image(image)
         
     h, w = image.shape[:2]
-    combined_mask = np.zeros((h, w), dtype=np.uint8)
+    combined_mask = np.zeros((h, w), dtype=np.uint16)
     score_map = np.zeros((h, w), dtype=np.float32)
     scores_list = []
     filtered_list = []
@@ -316,7 +315,7 @@ def run_sam2_multi_image_batch(predictor, images: list, clusters_list: list,
         predictor: SAM2ImagePredictor instance
         images: M 张 RGB 图像列表，每张 (H, W, 3) np.ndarray
         clusters_list: M 个 cluster 列表，clusters_list[i] 对应 images[i]
-        min_area: 最小 cluster 面积（像素数）
+        min_area: 送入 SAM 前的最小 cluster 面积
         prompt_batch_size: 全局 prompt 批大小
         score_threshold: 置信度阈值，低于此值的实例被过滤
 
@@ -355,7 +354,7 @@ def run_sam2_multi_image_batch(predictor, images: list, clusters_list: list,
         image_group_positions[img_indices_arr] = np.arange(len(img_indices_arr))
         h_img, w_img = orig_hw
         combined_masks_by_hw[orig_hw] = np.zeros(
-            (len(img_indices), h_img, w_img), dtype=np.uint8
+            (len(img_indices), h_img, w_img), dtype=np.uint16
         )
         score_maps_by_hw[orig_hw] = np.zeros(
             (len(img_indices), h_img, w_img), dtype=np.float32
@@ -368,10 +367,11 @@ def run_sam2_multi_image_batch(predictor, images: list, clusters_list: list,
         if clusters is None:
             continue
         for cluster_idx, cluster in enumerate(clusters):
-            if len(cluster) >= min_area:
-                prompt_records_by_hw[orig_hws[img_idx]].append(
-                    (img_idx, cluster_idx, cluster)
-                )
+            if len(cluster) < min_area:
+                continue
+            prompt_records_by_hw[orig_hws[img_idx]].append(
+                (img_idx, cluster_idx, cluster)
+            )
 
     num_prompts = sum(len(records) for records in prompt_records_by_hw.values())
 
@@ -828,7 +828,7 @@ def run_sam2_merged_box_mask(predictor, image: np.ndarray, cells_info: list,
         predictor.set_image(image)
         
     h, w = image.shape[:2]
-    combined_mask = np.zeros((h, w), dtype=np.uint8)
+    combined_mask = np.zeros((h, w), dtype=np.uint16)
     scores_list = []
     merge_info = []
     
@@ -884,6 +884,7 @@ def merge_connected_masks(instance_mask: np.ndarray, scores_list: list,
                           positive_cells_info: list = None,
                           min_area: int = 0,
                           debug_dir: str = None,
+                          debug_prefix: str = None,
                           original_image: np.ndarray = None) -> tuple:
     """
     将重叠或相连的 mask 实例合并为单个实例。
@@ -893,7 +894,9 @@ def merge_connected_masks(instance_mask: np.ndarray, scores_list: list,
         scores_list: (instance_id, score) 元组列表
         positive_cells_info: 可选的细胞信息字典列表
         min_area: 连通区域最小面积阈值（0 = 不过滤）
-        debug_dir: 若提供，保存合并/过滤过程的可视化图（由 --debug-vis 控制）
+        debug_dir: 若提供，保存合并/过滤过程的区域调试可视化图
+        debug_prefix: 若提供，将调试文件写成外层 pipeline 步骤名
+            （例如 step5_01_merge_filter_*.png）
         original_image: 用于叠加可视化的原始图像
 
     返回:
@@ -903,6 +906,16 @@ def merge_connected_masks(instance_mask: np.ndarray, scores_list: list,
         merged_cells_info: 合并后的细胞信息字典列表（长度等于新实例数量）
     """
     import os
+
+    def _merge_debug_image_name(order: int, legacy_step: int, stem: str) -> str:
+        if debug_prefix:
+            return f"{debug_prefix}_{order:02d}_merge_filter_{stem}.png"
+        return f"step{legacy_step}_{stem}.png"
+
+    def _merge_debug_summary_name(order: int) -> str:
+        if debug_prefix:
+            return f"{debug_prefix}_{order:02d}_merge_filter_summary.json"
+        return "merge_summary.json"
     
     if instance_mask is None or np.max(instance_mask) == 0:
         return instance_mask, scores_list, {}, positive_cells_info
@@ -943,13 +956,15 @@ def merge_connected_masks(instance_mask: np.ndarray, scores_list: list,
         
         # 1. 保存合并前的可视化（SAM2 原始输出）
         pre_merge_viz = _create_instance_mask_visualization(instance_mask, h, w, "SAM2 Raw Output")
-        cv2.imwrite(os.path.join(debug_dir, "step1_sam2_raw_output.png"), 
+        cv2.imwrite(os.path.join(
+            debug_dir, _merge_debug_image_name(1, 1, "sam2_raw_output")),
                    cv2.cvtColor(pre_merge_viz, cv2.COLOR_RGB2BGR))
         
         # 若有原始图像，创建叠加可视化
         if original_image is not None:
             overlay = _create_mask_overlay(original_image, instance_mask)
-            cv2.imwrite(os.path.join(debug_dir, "step1_sam2_raw_overlay.png"),
+            cv2.imwrite(os.path.join(
+                debug_dir, _merge_debug_image_name(2, 1, "sam2_raw_overlay")),
                        cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
 
     # 创建合并后的掩膜（使用 uint16 以支持 >255 个实例）
@@ -1039,18 +1054,21 @@ def merge_connected_masks(instance_mask: np.ndarray, scores_list: list,
         # 2. 保存被过滤区域的可视化
         if filtered_regions:
             filtered_viz = _create_filtered_regions_visualization(labels, filtered_regions, h, w)
-            cv2.imwrite(os.path.join(debug_dir, "step2_filtered_regions.png"), 
+            cv2.imwrite(os.path.join(
+                debug_dir, _merge_debug_image_name(3, 2, "filtered_regions")),
                        cv2.cvtColor(filtered_viz, cv2.COLOR_RGB2BGR))
         
         # 3. 保存合并后的可视化
         post_merge_viz = _create_instance_mask_visualization(merged_mask, h, w, "Merged & Filtered")
-        cv2.imwrite(os.path.join(debug_dir, "step3_merged_result.png"), 
+        cv2.imwrite(os.path.join(
+            debug_dir, _merge_debug_image_name(4, 3, "merged_result")),
                    cv2.cvtColor(post_merge_viz, cv2.COLOR_RGB2BGR))
         
         # 若有原始图像，创建最终叠加可视化
         if original_image is not None:
             final_overlay = _create_mask_overlay(original_image, merged_mask)
-            cv2.imwrite(os.path.join(debug_dir, "step3_merged_overlay.png"), 
+            cv2.imwrite(os.path.join(
+                debug_dir, _merge_debug_image_name(5, 3, "merged_overlay")),
                        cv2.cvtColor(final_overlay, cv2.COLOR_RGB2BGR))
         
         # 4. 保存合并汇总 JSON
@@ -1066,7 +1084,8 @@ def merge_connected_masks(instance_mask: np.ndarray, scores_list: list,
             'merged_regions': [{'new_id': int(s[0]), 'avg_score': float(s[1]), 
                                'member_ids': [int(m) for m in s[2]]} for s in merged_scores]
         }
-        with open(os.path.join(debug_dir, "merge_summary.json"), 'w') as f:
+        with open(os.path.join(
+                debug_dir, _merge_debug_summary_name(6)), 'w') as f:
             json.dump(summary, f, indent=2)
         
         print(f"      Saved merge/filter visualization to {debug_dir}/")
@@ -1159,7 +1178,7 @@ def run_sam2_mask_with_point(predictor, image: np.ndarray, cells_info: list,
         predictor.set_image(image)
         
     h, w = image.shape[:2]
-    combined_mask = np.zeros((h, w), dtype=np.uint8)
+    combined_mask = np.zeros((h, w), dtype=np.uint16)
     scores_list = []
 
     for idx, cell in enumerate(cells_info):
@@ -1219,8 +1238,8 @@ def run_sam2_point_iterative(predictor, image: np.ndarray, cells_info: list,
         
     h, w = image.shape[:2]
     
-    combined_mask_pass1 = np.zeros((h, w), dtype=np.uint8)
-    combined_mask_pass2 = np.zeros((h, w), dtype=np.uint8)
+    combined_mask_pass1 = np.zeros((h, w), dtype=np.uint16)
+    combined_mask_pass2 = np.zeros((h, w), dtype=np.uint16)
     scores_pass1 = []
     scores_pass2 = []
 
@@ -1289,7 +1308,7 @@ def run_sam2_segmentation_batch(predictor, image: np.ndarray, clusters: list,
         predictor: SAM2ImagePredictor instance
         image: RGB image array
         clusters: List of cluster coordinate arrays
-        min_area: Minimum cluster size
+        min_area: Minimum cluster size before SAM inference
         set_image: Whether to call predictor.set_image()
         batch_size: Number of prompts to process at once
         score_threshold: Minimum score threshold
@@ -1303,16 +1322,17 @@ def run_sam2_segmentation_batch(predictor, image: np.ndarray, clusters: list,
         predictor.set_image(image)
 
     h, w = image.shape[:2]
-    combined_mask = np.zeros((h, w), dtype=np.uint8)
+    combined_mask = np.zeros((h, w), dtype=np.uint16)
     score_map = np.zeros((h, w), dtype=np.float32)
     scores_list = []
     filtered_list = []
 
-    # 1. 过滤有效的 clusters
+    # 1. Filter clusters before constructing SAM prompts.
     valid_clusters = []
     for idx, cluster in enumerate(clusters):
-        if len(cluster) >= min_area:
-            valid_clusters.append((idx, cluster))
+        if len(cluster) < min_area:
+            continue
+        valid_clusters.append((idx, cluster))
 
     if len(valid_clusters) == 0:
         return combined_mask, scores_list, filtered_list

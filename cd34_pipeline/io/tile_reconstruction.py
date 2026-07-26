@@ -339,7 +339,8 @@ def export_geojson(tile_dir: Optional[str],
                    masks: Optional[dict] = None,
                    level_downsample: float = 1.0,
                    crop_origin: Optional[tuple[int, int]] = None,
-                   debug_dir: Optional[str] = None) -> str:
+                   debug_dir: Optional[str] = None,
+                   merge_mode: str = "overlap-merge") -> str:
     """
     导出 QuPath 兼容的 GeoJSON 标注文件。
 
@@ -367,6 +368,12 @@ def export_geojson(tile_dir: Optional[str],
                      若非 None，导出时会将多边形坐标从 crop-relative target-level
                      转换为 level-0 绝对坐标: coord * level_downsample + crop_origin
         debug_dir: 若提供，写出跨 tile stitching 的候选/拒绝/合并诊断。
+        merge_mode:
+            - "overlap-merge": 旧行为，扫描 overlap 并合并相邻 tile 实例。
+            - "center-valid": polygon 使用 owner/中心有效区；如果提供未裁剪
+              masks，仍扫描 overlap 作为跨 tile 身份匹配证据。
+            - "center-valid-raw": polygon 使用 owner/中心有效区，并跳过跨
+              tile 合并，用于查看不拼接的原始 tile 输出。
 
     Returns:
         输出文件路径
@@ -375,6 +382,12 @@ def export_geojson(tile_dir: Optional[str],
     from shapely.ops import unary_union
 
     in_memory = poly_map is not None and masks is not None
+    merge_mode = merge_mode.replace("_", "-")
+    if merge_mode not in {
+            "overlap-merge", "center-valid", "center-valid-raw"}:
+        raise ValueError(
+            "merge_mode must be 'overlap-merge', 'center-valid', "
+            "or 'center-valid-raw'")
 
     print(f"\n{'='*60}")
     print(f"GEOJSON EXPORT ({'in-memory' if in_memory else 'tile-based'} merge)")
@@ -382,6 +395,7 @@ def export_geojson(tile_dir: Optional[str],
         print(f"Input:    {tile_dir}")
     print(f"Output:   {output_path}")
     print(f"Tile:     {tile_size}, stride: {stride}, overlap: {tile_size - stride}")
+    print(f"Mode:     {merge_mode}")
     print(f"Simplify: {simplify}, contour_tolerance: {contour_tolerance}, min_area: {min_area}")
     need_transform = level_downsample != 1.0 or crop_origin is not None
     if need_transform:
@@ -460,6 +474,9 @@ def export_geojson(tile_dir: Optional[str],
     MERGE_MIN_AREA_RATIO = 0.25
     MERGE_MIN_CENTROID_DISTANCE = 32.0
     MERGE_CENTROID_DIAMETER_FACTOR = 2.0
+    MERGE_STRONG_MIN_INTERSECTION_PIXELS = 100
+    MERGE_STRONG_MIN_DICE = 0.60
+    MERGE_STRONG_MIN_OVERLAP_RATIO = 0.60
     MERGE_ENABLE_DIAGONAL = False
     debug_matches = [] if debug_dir else None
     if debug_dir:
@@ -486,6 +503,10 @@ def export_geojson(tile_dir: Optional[str],
           f"min_dice={MERGE_MIN_DICE:.2f}, "
           f"min_overlap_ratio={MERGE_MIN_OVERLAP_RATIO:.2f}, "
           f"min_area_ratio={MERGE_MIN_AREA_RATIO:.2f}")
+    print(f"    strong_overlap bypass: "
+          f"intersection>={MERGE_STRONG_MIN_INTERSECTION_PIXELS}, "
+          f"dice>={MERGE_STRONG_MIN_DICE:.2f}, "
+          f"overlap_ratio>={MERGE_STRONG_MIN_OVERLAP_RATIO:.2f}")
     print(f"    max_centroid_distance={max_centroid_distance:.1f}px, "
           f"diagonal={'ON' if MERGE_ENABLE_DIAGONAL else 'OFF'}")
 
@@ -658,6 +679,11 @@ def export_geojson(tile_dir: Optional[str],
                 stat_a['cx'] - stat_b['cx'],
                 stat_a['cy'] - stat_b['cy'],
             ))
+            strong_overlap = (
+                intersection >= MERGE_STRONG_MIN_INTERSECTION_PIXELS * multiplier
+                and dice >= MERGE_STRONG_MIN_DICE
+                and overlap_ratio >= MERGE_STRONG_MIN_OVERLAP_RATIO
+            )
 
             record = None
             if base_record is not None:
@@ -671,6 +697,7 @@ def export_geojson(tile_dir: Optional[str],
                     'full_area_b': int(full_area_b),
                     'area_ratio': float(area_ratio),
                     'centroid_distance': float(centroid_distance),
+                    'strong_overlap': bool(strong_overlap),
                     'centroid_a': [float(stat_a['cx']), float(stat_a['cy'])],
                     'centroid_b': [float(stat_b['cx']), float(stat_b['cy'])],
                 })
@@ -690,12 +717,12 @@ def export_geojson(tile_dir: Optional[str],
                     record['rejected_reason'] = 'min_overlap_ratio'
                     _append_match_record(record)
                 continue
-            if area_ratio < MERGE_MIN_AREA_RATIO:
+            if area_ratio < MERGE_MIN_AREA_RATIO and not strong_overlap:
                 if record is not None:
                     record['rejected_reason'] = 'min_area_ratio'
                     _append_match_record(record)
                 continue
-            if centroid_distance > max_centroid_distance:
+            if centroid_distance > max_centroid_distance and not strong_overlap:
                 if record is not None:
                     record['rejected_reason'] = 'max_centroid_distance'
                     _append_match_record(record)
@@ -748,11 +775,19 @@ def export_geojson(tile_dir: Optional[str],
 
         return raw_pairs, len(candidates), accepted
 
-    if overlap <= 0:
+    if merge_mode == "center-valid-raw":
+        print("  Center-valid raw mode: skipping cross-tile matching.")
+        t2 = time.time()
+        print(f"  Pass 2 done: 0 overlap pairs, 0 eligible, 0 merges "
+              f"({t2-t1:.0f}s)")
+    elif overlap <= 0:
         print("  No tile overlap configured; skipping cross-tile matching.")
         t2 = time.time()
         print(f"  Pass 2 done: 0 overlap pairs, 0 eligible, 0 merges ({t2-t1:.0f}s)")
     else:
+        if merge_mode == "center-valid":
+            print("  Center-valid mode: matching with overlap masks while "
+                  "exporting owner-cropped polygons.")
         for idx, (row, col) in enumerate(tile_keys):
             mask_a = _load_mask(row, col)
             if mask_a is None:
@@ -823,7 +858,7 @@ def export_geojson(tile_dir: Optional[str],
             "direction", "tile_a", "tile_b", "gid_a", "gid_b",
             "intersection", "area_a_overlap", "area_b_overlap",
             "dice", "overlap_ratio", "full_area_a", "full_area_b",
-            "area_ratio", "centroid_distance", "score",
+            "area_ratio", "centroid_distance", "strong_overlap", "score",
             "accepted", "unioned", "rejected_reason",
             "centroid_a", "centroid_b",
         ]
@@ -888,13 +923,36 @@ def export_geojson(tile_dir: Optional[str],
 
     features = []
     skipped = 0
+    center_valid_seam_buffer = 0.5
+
+    def _union_group_polygons(polys):
+        if len(polys) == 1:
+            return polys[0]
+
+        merged = unary_union(polys)
+        if (merge_mode == "center-valid" and
+                center_valid_seam_buffer > 0 and
+                not merged.is_empty):
+            try:
+                buffered = [
+                    p.buffer(center_valid_seam_buffer, join_style=2)
+                    for p in polys
+                    if not p.is_empty
+                ]
+                if buffered:
+                    closed = unary_union(buffered).buffer(
+                        -center_valid_seam_buffer,
+                        join_style=2,
+                    )
+                    if not closed.is_empty:
+                        return closed
+            except Exception:
+                pass
+        return merged
 
     for grp_idx, (root, polys) in enumerate(groups.items()):
         try:
-            if len(polys) == 1:
-                merged = polys[0]
-            else:
-                merged = unary_union(polys)
+            merged = _union_group_polygons(polys)
 
             if merged.is_empty:
                 skipped += 1

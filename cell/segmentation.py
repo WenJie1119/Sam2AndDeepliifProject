@@ -10,7 +10,7 @@ class CellSegmentor:
 
     def __init__(self, seg_thresh: int = 120,
                  marker_thresh: int = None,
-                 marker_percentile_factor: float = 0.9,
+                 marker_percentile_factor: float = 0.8,
                  morphology_kernel: int = 11,
                  min_area: int = 50):
         self.seg_thresh = seg_thresh
@@ -45,7 +45,6 @@ class CellSegmentor:
             marker_thresh=self.marker_thresh,
             marker_percentile_factor=self.marker_percentile_factor,
             morphology_kernel=self.morphology_kernel,
-            min_area=self.min_area,
         )
 
         if len(positive_cells_info) == 0:
@@ -53,3 +52,31 @@ class CellSegmentor:
 
         clusters = get_clusters_from_cells(positive_cells_info)
         return positive_cells_info, clusters
+
+    def extract_with_masks(self, seg_np: np.ndarray,
+                           marker_np: np.ndarray) -> tuple[list, list, dict]:
+        """
+        Extract positive regions and return the masks used during extraction.
+
+        The extra masks are intended for debug visualization, so step rendering
+        can reuse the same filtering result instead of recalculating it.
+        """
+        from cd34_pipeline.cell.extraction import (
+            extract_connected_positive_regions,
+            get_clusters_from_cells,
+        )
+
+        positive_cells_info, debug_masks = extract_connected_positive_regions(
+            seg_np, marker_np,
+            seg_thresh=self.seg_thresh,
+            marker_thresh=self.marker_thresh,
+            marker_percentile_factor=self.marker_percentile_factor,
+            morphology_kernel=self.morphology_kernel,
+            return_debug_masks=True,
+        )
+
+        if len(positive_cells_info) == 0:
+            return [], [], debug_masks
+
+        clusters = get_clusters_from_cells(positive_cells_info)
+        return positive_cells_info, clusters, debug_masks

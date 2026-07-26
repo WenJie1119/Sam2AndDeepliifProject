@@ -10,6 +10,7 @@ Instead of writing intermediate .npy files, this module:
 import os
 import threading
 
+import cv2
 import numpy as np
 
 from cd34_pipeline.io.tile_reconstruction import (
@@ -18,20 +19,68 @@ from cd34_pipeline.io.tile_reconstruction import (
 )
 
 
+def _fill_binary_holes(mask: np.ndarray) -> np.ndarray:
+    """Fill only holes fully enclosed by a binary mask."""
+    if not mask.any():
+        return mask
+
+    src = mask.astype(np.uint8, copy=False)
+    padded = np.pad(src, 1, mode="constant", constant_values=0)
+    exterior = padded.copy()
+    cv2.floodFill(exterior, None, (0, 0), 1)
+    holes = exterior[1:-1, 1:-1] == 0
+    return mask | holes
+
+
+def _fill_instance_holes(instance_mask: np.ndarray) -> tuple[np.ndarray, int]:
+    """Fill enclosed background holes inside each instance label."""
+    if instance_mask is None or instance_mask.size == 0:
+        return instance_mask, 0
+
+    result = instance_mask.copy()
+    original = instance_mask
+    filled_px = 0
+    for inst_id in np.unique(original):
+        if inst_id == 0:
+            continue
+        region = original == inst_id
+        filled = _fill_binary_holes(region)
+        holes = filled & ~region & (result == 0)
+        if holes.any():
+            result[holes] = inst_id
+            filled_px += int(holes.sum())
+    return result, filled_px
+
+
 class PostProcessor:
     """Merges SAM2 masks into instance labels, extracts polygons in memory,
     then exports GeoJSON without intermediate .npy files."""
 
-    def __init__(self, output_dir: str, min_area: int = 200,
+    def __init__(self, output_dir: str, min_area: int = 0,
                  tile_size: int = 512, overlap: int = 128,
+                 stitch_mode: str = "center-valid",
+                 tile_records: list[dict] | None = None,
                  debug_region_metadata: dict | None = None,
-                 debug_region_tiles: list[dict] | None = None):
+                 debug_region_tiles: list[dict] | None = None,
+                 fill_sam_holes: bool = False):
         self.output_dir = output_dir
         self.min_area = min_area
         self.tile_size = tile_size
+        self.overlap = overlap
         self.stride = tile_size - overlap
+        self.stitch_mode = stitch_mode.replace("_", "-")
+        if self.stitch_mode not in {
+                "center-valid", "center-valid-raw", "overlap-merge"}:
+            raise ValueError(
+                "stitch_mode must be 'center-valid', 'center-valid-raw', "
+                "or 'overlap-merge'")
+        self.tile_keys = (
+            {(int(t["row"]), int(t["col"])) for t in tile_records}
+            if tile_records is not None else None
+        )
         self.debug_region_metadata = debug_region_metadata
         self.debug_region_tiles = debug_region_tiles or []
+        self.fill_sam_holes = fill_sam_holes
         self.debug_region_dir = (
             os.path.join(output_dir, "debug_region")
             if debug_region_metadata is not None else None
@@ -39,7 +88,8 @@ class PostProcessor:
 
         # Pass 1 result: {(row, col, inst_id): [Polygon, ...]}
         self.poly_map: dict = {}
-        # Full masks for Pass 2: {(row, col): ndarray}
+        # Stitching masks for Pass 2: {(row, col): ndarray}.  In center-valid
+        # mode these stay uncropped so overlap evidence can still link tiles.
         self.masks: dict = {}
         # Region debug tiles: {(row, col): {'tile_np', 'sam_mask', 'merged_mask'}}
         self.debug_tiles: dict = {}
@@ -63,7 +113,8 @@ class PostProcessor:
         Args:
             sam_mask: raw SAM2 mask array
             scores: score list from SAM2
-            positive_cells_info: cell dicts from CellSegmentor
+            positive_cells_info: optional region metadata; weighted-points
+                passes an empty list.
             tile_name: tile identifier (e.g. "tile_5_12_5632_2048")
 
         Returns:
@@ -78,13 +129,16 @@ class PostProcessor:
             from cell.debug_vis import DebugVisualizer
             dbg = DebugVisualizer(self.output_dir, tile_name)
             dbg.step4_sam2_raw(tile_np, sam_mask)
-            merge_debug_dir = os.path.join(dbg.dir, "merge_steps")
+            dbg.clear_step5_merge_outputs()
             merged, _, _, _ = merge_connected_masks(
                 sam_mask, scores, positive_cells_info,
                 min_area=self.min_area,
-                debug_dir=merge_debug_dir,
+                debug_dir=dbg.dir,
+                debug_prefix="step5",
                 original_image=tile_np,
             )
+            if self.fill_sam_holes:
+                merged, _ = _fill_instance_holes(merged)
             dbg.step5_merged(tile_np, merged)
             dbg.step7_sam2_merge_diff(
                 tile_np, sam_mask, merged, positive_cells_info)
@@ -93,10 +147,8 @@ class PostProcessor:
                 sam_mask, scores, positive_cells_info,
                 min_area=self.min_area,
             )
-
-        if debug_enabled:
-            self._store_debug_tile(tile_name, tile_info, tile_np,
-                                   sam_mask, merged)
+            if self.fill_sam_holes:
+                merged, _ = _fill_instance_holes(merged)
 
         if np.max(merged) > 0:
             max_id = int(np.max(merged))
@@ -120,8 +172,17 @@ class PostProcessor:
                 gx = col * self.stride
                 gy = row * self.stride
 
+            stitch_mask = merged
+            export_mask = self._apply_center_valid_crop(
+                merged, row, col, tile_info)
+            if debug_enabled:
+                self._store_debug_tile(tile_name, tile_info, tile_np,
+                                       sam_mask, export_mask)
+            if np.max(export_mask) == 0:
+                return False
+
             # -- Pass 1: extract polygons (CPU-intensive, no lock needed) --
-            tile_polys = _extract_tile_polygons(merged, gx, gy)
+            tile_polys = _extract_tile_polygons(export_mask, gx, gy)
 
             # -- Thread-safe update of shared state --
             with self._lock:
@@ -132,11 +193,53 @@ class PostProcessor:
                     self.poly_map[gid].append(poly)
 
                 # -- Store mask for Pass 2 overlap matching --
-                self.masks[(row, col)] = merged
+                self.masks[(row, col)] = stitch_mask
 
                 self._processed += 1
             return True
         return False
+
+    def _apply_center_valid_crop(self, mask: np.ndarray, row: int, col: int,
+                                 tile_info: dict | None) -> np.ndarray:
+        """Keep only the owner/center-valid part of a tile mask."""
+        if (self.stitch_mode not in {"center-valid", "center-valid-raw"}
+                or self.overlap <= 0):
+            return mask
+
+        h, w = mask.shape[:2]
+        if h == 0 or w == 0:
+            return mask
+
+        half_left = self.overlap // 2
+        half_top = self.overlap // 2
+        half_right = self.overlap - half_left
+        half_bottom = self.overlap - half_top
+
+        def _has_tile(r: int, c: int) -> bool:
+            return self.tile_keys is None or (r, c) in self.tile_keys
+
+        crop_left = half_left if _has_tile(row, col - 1) else 0
+        crop_top = half_top if _has_tile(row - 1, col) else 0
+        crop_right = half_right if _has_tile(row, col + 1) else 0
+        crop_bottom = half_bottom if _has_tile(row + 1, col) else 0
+
+        x0 = min(crop_left, w)
+        y0 = min(crop_top, h)
+        x1 = min(self.tile_size - crop_right, w)
+        y1 = min(self.tile_size - crop_bottom, h)
+
+        if tile_info is not None:
+            actual_w = int(tile_info.get("actual_w", w))
+            actual_h = int(tile_info.get("actual_h", h))
+            x1 = min(x1, actual_w, w)
+            y1 = min(y1, actual_h, h)
+
+        if x1 <= x0 or y1 <= y0:
+            return np.zeros_like(mask)
+
+        center_mask = np.zeros_like(mask)
+        center_mask[y0:y1, x0:x1] = mask[y0:y1, x0:x1]
+        return center_mask
 
     def _store_debug_tile(self, tile_name: str, tile_info: dict | None,
                           tile_np: np.ndarray, sam_mask: np.ndarray,
@@ -224,6 +327,7 @@ class PostProcessor:
             level_downsample=level_downsample,
             crop_origin=crop_origin,
             debug_dir=self.debug_region_dir,
+            merge_mode=self.stitch_mode,
         )
 
         if self.debug_region_dir is not None:

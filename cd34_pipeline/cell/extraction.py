@@ -13,6 +13,17 @@ import cv2
 from typing import Optional, Tuple
 
 
+MARKER_MIN_KEEP_INTENSITY = 20
+
+
+def enforce_marker_min_keep_threshold(
+        marker_thresh: int,
+        min_keep_intensity: int = MARKER_MIN_KEEP_INTENSITY) -> int:
+    """Apply the minimum retained Marker intensity to a ``marker > threshold`` rule."""
+    min_keep_intensity = int(np.clip(min_keep_intensity, 0, 255))
+    return max(int(marker_thresh), min_keep_intensity - 1)
+
+
 # ============================================================================
 # 辅助函数 - 共享逻辑 (供 extract_cells_from_seg 和 pipeline_visualization 使用)
 # ============================================================================
@@ -88,15 +99,17 @@ def compute_posneg_mask(seg_array: np.ndarray,
 
 
 def compute_marker_threshold(marker_gray: np.ndarray,
-                             percentile_factor: float = 0.9) -> int:
+                             percentile_factor: float = 0.8) -> int:
     """
     自动计算 Marker 阈值。
     
-    使用非零像素的 0.1%-99.9% 范围，根据 percentile_factor 取范围内位置。
+    使用非零像素的最小值和最大值，从最大值往下保留
+    percentile_factor 比例的强度范围。
     
     Args:
         marker_gray: 灰度 Marker 图像
-        percentile_factor: 阈值在范围内的位置 (默认 0.9 = 接近高端)
+        percentile_factor: 从最大值往下保留的强度范围比例
+                           (默认 0.8 = 保留最高端 80% 范围)
         
     Returns:
         计算得到的 Marker 阈值 (整数)
@@ -104,13 +117,321 @@ def compute_marker_threshold(marker_gray: np.ndarray,
     nonzero_marker = marker_gray[marker_gray > 0]
     
     if len(nonzero_marker) > 0:
-        marker_range_min = np.percentile(nonzero_marker, 0.1)
-        marker_range_max = np.percentile(nonzero_marker, 99.9)
-        marker_thresh = int((marker_range_max - marker_range_min) * percentile_factor + marker_range_min)
+        marker_range_min = float(nonzero_marker.min())
+        marker_range_max = float(nonzero_marker.max())
+        marker_thresh = int(
+            marker_range_max
+            - (marker_range_max - marker_range_min) * percentile_factor
+        )
     else:
         marker_thresh = 128  # fallback
     
-    return marker_thresh
+    return enforce_marker_min_keep_threshold(marker_thresh)
+
+
+def compute_marker_peak_threshold(marker_gray: np.ndarray) -> int:
+    """Return the dominant non-zero Marker intensity as a threshold.
+
+    Downstream masks use ``marker > threshold``, so using the histogram peak
+    keeps pixels on the right side of the main background/weak-marker mode.
+    """
+    marker_gray = np.clip(marker_gray, 0, 255).astype(np.uint8)
+    nonzero_marker = marker_gray[marker_gray > 0]
+    if nonzero_marker.size == 0:
+        return 128
+
+    counts = np.bincount(nonzero_marker, minlength=256)[:256]
+    return int(np.argmax(counts[1:]) + 1)
+
+
+def compute_marker_multi_otsu_thresholds(marker_gray: np.ndarray
+                                         ) -> tuple[int, int]:
+    """Return 3-class Multi-Otsu thresholds for non-zero Marker pixels.
+
+    The returned thresholds split non-zero Marker intensities into low, middle,
+    and high classes.  Keeping the middle+high classes should use
+    ``marker > low_threshold``.
+    """
+    marker_gray = np.clip(marker_gray, 0, 255).astype(np.uint8)
+    nonzero_marker = marker_gray[marker_gray > 0]
+    if nonzero_marker.size == 0:
+        return 128, 192
+
+    values = np.unique(nonzero_marker)
+    if values.size == 1:
+        value = int(values[0])
+        return max(0, value - 1), value
+    if values.size == 2:
+        low = int(values[0])
+        return low, low
+
+    counts = np.bincount(nonzero_marker, minlength=256)[:256].astype(
+        np.float64)
+    intensities = np.arange(256, dtype=np.float64)
+    cumulative_counts = np.cumsum(counts)
+    cumulative_sums = np.cumsum(counts * intensities)
+    total_count = cumulative_counts[-1]
+    total_sum = cumulative_sums[-1]
+
+    best_score = -np.inf
+    best_thresholds = (int(values[0]), int(values[-2]))
+    for low_threshold in range(0, 254):
+        low_count = cumulative_counts[low_threshold]
+        if low_count <= 0:
+            continue
+        low_sum = cumulative_sums[low_threshold]
+
+        for high_threshold in range(low_threshold + 1, 255):
+            mid_count = (
+                cumulative_counts[high_threshold]
+                - cumulative_counts[low_threshold]
+            )
+            high_count = total_count - cumulative_counts[high_threshold]
+            if mid_count <= 0 or high_count <= 0:
+                continue
+
+            mid_sum = (
+                cumulative_sums[high_threshold]
+                - cumulative_sums[low_threshold]
+            )
+            high_sum = total_sum - cumulative_sums[high_threshold]
+
+            score = (
+                (low_sum * low_sum / low_count)
+                + (mid_sum * mid_sum / mid_count)
+                + (high_sum * high_sum / high_count)
+            )
+            if score > best_score:
+                best_score = score
+                best_thresholds = (low_threshold, high_threshold)
+
+    return int(best_thresholds[0]), int(best_thresholds[1])
+
+
+def compute_marker_range_otsu_threshold(
+        marker_gray: np.ndarray,
+        min_intensity: int,
+        max_intensity: int) -> int:
+    """Return a 2-class Otsu split inside an inclusive intensity range."""
+    min_intensity = int(np.clip(min_intensity, 0, 255))
+    max_intensity = int(np.clip(max_intensity, 0, 255))
+    if min_intensity >= max_intensity:
+        return min_intensity
+
+    marker_gray = np.clip(marker_gray, 0, 255).astype(np.uint8)
+    values = marker_gray[
+        (marker_gray >= min_intensity)
+        & (marker_gray <= max_intensity)
+    ]
+    if values.size == 0:
+        return min_intensity
+
+    unique_values = np.unique(values)
+    if unique_values.size == 1:
+        return int(unique_values[0])
+
+    counts = np.bincount(values, minlength=256)[:256].astype(np.float64)
+    intensities = np.arange(256, dtype=np.float64)
+    cumulative_counts = np.cumsum(counts)
+    cumulative_sums = np.cumsum(counts * intensities)
+    total_count = cumulative_counts[max_intensity]
+    total_sum = cumulative_sums[max_intensity]
+    if min_intensity > 0:
+        total_count -= cumulative_counts[min_intensity - 1]
+        total_sum -= cumulative_sums[min_intensity - 1]
+
+    best_score = -np.inf
+    best_threshold = min_intensity
+    for threshold in range(min_intensity, max_intensity):
+        low_count = cumulative_counts[threshold]
+        low_sum = cumulative_sums[threshold]
+        if min_intensity > 0:
+            low_count -= cumulative_counts[min_intensity - 1]
+            low_sum -= cumulative_sums[min_intensity - 1]
+        high_count = total_count - low_count
+        high_sum = total_sum - low_sum
+        if low_count <= 0 or high_count <= 0:
+            continue
+
+        low_mean = low_sum / low_count
+        high_mean = high_sum / high_count
+        low_weight = low_count / total_count
+        high_weight = high_count / total_count
+        score = low_weight * high_weight * (low_mean - high_mean) ** 2
+        if score > best_score:
+            best_score = score
+            best_threshold = threshold
+
+    return int(best_threshold)
+
+
+def compute_marker_range_multi_otsu_thresholds(
+        marker_gray: np.ndarray,
+        min_intensity: int,
+        max_intensity: int) -> tuple[int, int]:
+    """Return 3-class Multi-Otsu thresholds inside an inclusive range."""
+    min_intensity = int(np.clip(min_intensity, 0, 255))
+    max_intensity = int(np.clip(max_intensity, 0, 255))
+    if min_intensity >= max_intensity:
+        return min_intensity, min_intensity
+
+    marker_gray = np.clip(marker_gray, 0, 255).astype(np.uint8)
+    values = marker_gray[
+        (marker_gray >= min_intensity)
+        & (marker_gray <= max_intensity)
+    ]
+    if values.size == 0:
+        return min_intensity, max_intensity
+
+    unique_values = np.unique(values)
+    if unique_values.size == 1:
+        value = int(unique_values[0])
+        return value, value
+    if unique_values.size == 2:
+        value = int(unique_values[0])
+        return value, value
+
+    counts = np.bincount(values, minlength=256)[:256].astype(np.float64)
+    intensities = np.arange(256, dtype=np.float64)
+    cumulative_counts = np.cumsum(counts)
+    cumulative_sums = np.cumsum(counts * intensities)
+
+    def _range_count_sum(start: int, stop: int) -> tuple[float, float]:
+        count = cumulative_counts[stop]
+        total = cumulative_sums[stop]
+        if start > 0:
+            count -= cumulative_counts[start - 1]
+            total -= cumulative_sums[start - 1]
+        return count, total
+
+    best_score = -np.inf
+    best_thresholds = (int(unique_values[0]), int(unique_values[-2]))
+    for low_threshold in range(min_intensity, max_intensity - 1):
+        low_count, low_sum = _range_count_sum(
+            min_intensity, low_threshold)
+        if low_count <= 0:
+            continue
+
+        for high_threshold in range(low_threshold + 1, max_intensity):
+            mid_count, mid_sum = _range_count_sum(
+                low_threshold + 1, high_threshold)
+            high_count, high_sum = _range_count_sum(
+                high_threshold + 1, max_intensity)
+            if mid_count <= 0 or high_count <= 0:
+                continue
+
+            score = (
+                (low_sum * low_sum / low_count)
+                + (mid_sum * mid_sum / mid_count)
+                + (high_sum * high_sum / high_count)
+            )
+            if score > best_score:
+                best_score = score
+                best_thresholds = (low_threshold, high_threshold)
+
+    return int(best_thresholds[0]), int(best_thresholds[1])
+
+
+def compute_marker_two_stage_multi_otsu_threshold(
+        marker_gray: np.ndarray) -> int:
+    """Return the two-stage Multi-Otsu threshold for Marker positives.
+
+    Stage 1 splits non-zero Marker pixels into low/middle/high classes.
+    Stage 2 splits the stage-1 middle class into three classes again.  The
+    returned threshold keeps the upper middle class plus the stage-1 high class,
+    i.e. downstream code should use ``marker > threshold``.
+    """
+    outer_low_threshold, outer_high_threshold = (
+        compute_marker_multi_otsu_thresholds(marker_gray)
+    )
+    _, middle_high_threshold = compute_marker_range_multi_otsu_thresholds(
+        marker_gray,
+        outer_low_threshold + 1,
+        outer_high_threshold,
+    )
+    return enforce_marker_min_keep_threshold(middle_high_threshold)
+
+
+def compute_marker_two_stage_multi_otsu_details(
+        marker_gray: np.ndarray) -> dict:
+    """Return thresholds and the final keep threshold for diagnostics."""
+    outer_low_threshold, outer_high_threshold = (
+        compute_marker_multi_otsu_thresholds(marker_gray)
+    )
+    middle_low_threshold, middle_high_threshold = (
+        compute_marker_range_multi_otsu_thresholds(
+            marker_gray,
+            outer_low_threshold + 1,
+            outer_high_threshold,
+        )
+    )
+    raw_keep_threshold = int(middle_high_threshold)
+    keep_threshold = enforce_marker_min_keep_threshold(raw_keep_threshold)
+    return {
+        "outer_thresholds": [
+            int(outer_low_threshold),
+            int(outer_high_threshold),
+        ],
+        "middle_thresholds": [
+            int(middle_low_threshold),
+            int(middle_high_threshold),
+        ],
+        "raw_keep_threshold": raw_keep_threshold,
+        "marker_min_keep_intensity": int(MARKER_MIN_KEEP_INTENSITY),
+        "effective_keep_min_intensity": int(keep_threshold + 1),
+        "keep_threshold": int(keep_threshold),
+    }
+
+
+def compute_positive_masks(
+        seg_array: np.ndarray,
+        marker_array: np.ndarray,
+        seg_thresh: int = 120,
+        marker_thresh: Optional[int] = None,
+        marker_percentile_factor: float = 0.8) -> dict:
+    """Compute the Seg/Marker positive masks used by cell extraction.
+
+    Seg is the primary signal. Marker is an independent supplementary signal,
+    so the final positive mask is their union rather than their intersection.
+    """
+    if seg_array.ndim != 3 or seg_array.shape[2] < 3:
+        raise ValueError("DeepLIIF Seg image must be an RGB array")
+
+    if marker_array.ndim == 3:
+        marker_gray = cv2.cvtColor(marker_array[:, :, :3], cv2.COLOR_RGB2GRAY)
+    elif marker_array.ndim == 2:
+        marker_gray = marker_array.copy()
+    else:
+        raise ValueError("DeepLIIF Marker image must be grayscale or RGB")
+
+    if marker_gray.shape != seg_array.shape[:2]:
+        raise ValueError("Seg and Marker images must have the same dimensions")
+
+    effective_marker_thresh = marker_thresh
+    if effective_marker_thresh is None:
+        effective_marker_thresh = compute_marker_two_stage_multi_otsu_threshold(
+            marker_gray)
+    effective_marker_thresh = enforce_marker_min_keep_threshold(
+        effective_marker_thresh)
+
+    posneg_mask, is_foreground, _ = compute_posneg_mask(
+        seg_array, seg_thresh)
+    seg_positive = posneg_mask == 2
+
+    # Marker is deliberately not restricted by the Seg foreground mask: it
+    # supplements regions that the Seg branch may have missed.
+    marker_positive = marker_gray > effective_marker_thresh
+    combined_positive = seg_positive | marker_positive
+
+    return {
+        "posneg_mask": posneg_mask,
+        "is_foreground": is_foreground,
+        "marker_gray": marker_gray,
+        "marker_thresh": int(effective_marker_thresh),
+        "seg_positive": seg_positive,
+        "marker_positive": marker_positive,
+        "combined_positive": combined_positive,
+    }
 
 
 def extract_positive_cells_info(seg_refined_array: np.ndarray, 
@@ -227,9 +548,11 @@ def extract_cells_from_seg(seg_array: np.ndarray,
         marker_thresh = compute_marker_threshold(marker_gray)
         nonzero_marker = marker_gray[marker_gray > 0]
         if len(nonzero_marker) > 0:
-            marker_range_min = np.percentile(nonzero_marker, 0.1)
-            marker_range_max = np.percentile(nonzero_marker, 99.9)
-            print(f"    [DEBUG] Auto marker_thresh: {marker_thresh} (range: {marker_range_min:.1f} - {marker_range_max:.1f})")
+            marker_range_min = float(nonzero_marker.min())
+            marker_range_max = float(nonzero_marker.max())
+            print(f"    [DEBUG] Auto marker_thresh: {marker_thresh} "
+                  f"(min/max range: {marker_range_min:.1f} - "
+                  f"{marker_range_max:.1f}, keep_ratio=0.8)")
         else:
             print(f"    [DEBUG] Fallback marker_thresh: {marker_thresh}")
     
@@ -636,10 +959,11 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
                                         marker_array: np.ndarray,
                                         seg_thresh: int = 120,
                                         marker_thresh: Optional[int] = None,
-                                        marker_percentile_factor: float = 0.9,
+                                        marker_percentile_factor: float = 0.8,
                                         morphology_kernel: int = 11,
                                         min_area: int = 200,
-                                        debug_dir: Optional[str] = None) -> list:
+                                        debug_dir: Optional[str] = None,
+                                        return_debug_masks: bool = False) -> list:
     """
     Seg + Marker 联合提取连通的阳性区域。
 
@@ -651,9 +975,9 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
 
     流程：
     1. 从 Seg 提取前景像素: (R+B > seg_thresh) && (G <= 80)
-    2. 在前景中，用 Seg 判断阳性像素: R >= B
-    3. 在前景中，用 Marker 阈值确认阳性像素: marker > marker_thresh
-    4. Seg 阳性和 Marker 阳性取交集，作为最终阳性像素
+    2. Seg 阳性像素: R >= B
+    3. Marker 阳性像素: marker > marker_thresh
+    4. Seg 阳性和 Marker 阳性取并集，Marker 作为 Seg 的补充
     5. 形态学闭运算：连接相邻的阳性像素（关键步骤！）
     6. 形态学开运算：去除小噪点
     7. 8-连通组件分析：提取每个连通区域作为整体
@@ -663,10 +987,10 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
         marker_array: DeepLIIF Marker 输出（灰度或RGB）
         seg_thresh: Seg 前景检测阈值 (默认120)
         marker_thresh: Marker 阳性阈值。None = 自动计算
-        marker_percentile_factor: 自动 Marker 阈值在 0.1%-99.9% 范围内的位置
+        marker_percentile_factor: 从 Marker 最大值往下保留的强度范围比例
         morphology_kernel: 形态学闭运算核大小，越大连接性越强
                           推荐值: 7-15 (默认11)
-        min_area: 最小区域面积（像素数），过滤小碎片 (默认200)
+        min_area: 保留给调用兼容；连通域提取阶段不按面积过滤
         debug_dir: 如果非 None，在该目录保存每步中间结果的可视化图
 
     Returns:
@@ -680,18 +1004,24 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
             - 'marker_mean': marker平均值
             - 'is_positive': True
     """
-    # Marker 转灰度
-    if marker_array.ndim == 3:
-        marker_gray = cv2.cvtColor(marker_array, cv2.COLOR_RGB2GRAY)
-    else:
-        marker_gray = marker_array.copy()
+    auto_marker_thresh = marker_thresh is None
+    masks = compute_positive_masks(
+        seg_array,
+        marker_array,
+        seg_thresh=seg_thresh,
+        marker_thresh=marker_thresh,
+        marker_percentile_factor=marker_percentile_factor,
+    )
+    posneg_mask = masks["posneg_mask"]
+    is_foreground = masks["is_foreground"]
+    marker_gray = masks["marker_gray"]
+    marker_thresh = masks["marker_thresh"]
+    seg_positive = masks["seg_positive"]
+    marker_positive = masks["marker_positive"]
 
-    # 自动计算 marker 阈值
-    if marker_thresh is None:
-        marker_thresh = compute_marker_threshold(
-            marker_gray, percentile_factor=marker_percentile_factor)
+    if auto_marker_thresh:
         print(f"    [Connected Region] Auto marker_thresh: {marker_thresh} "
-              f"(percentile_factor={marker_percentile_factor})")
+              "(two_stage_multiotsu: upper middle + high)")
 
     # 用于保存 debug 图片的辅助函数
     def _save_debug(name, img):
@@ -702,9 +1032,7 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
             if isinstance(img, np.ndarray):
                 _PILImage.fromarray(img).save(os.path.join(debug_dir, name))
 
-    # === Step 1: 从 Seg 提取��景 ===
-    posneg_mask, is_foreground, _ = compute_posneg_mask(seg_array, seg_thresh)
-
+    # === Step 1: 从 Seg 提取前景 ===
     if debug_dir is not None:
         # 前景掩码可视化: 白色=前景, 黑色=背景
         fg_vis = (is_foreground.astype(np.uint8) * 255)
@@ -715,40 +1043,36 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
         posneg_vis[posneg_mask == 1] = [0, 0, 255]    # 阴性=蓝
         _save_debug("cr_step1_posneg_mask.png", posneg_vis)
 
-    # === Step 2: 确定阳性像素（Seg阳性 AND Marker阳性） ===
-    # Seg 判断的阳性: posneg_mask == 2 (即 R >= B 的前景像素)
-    seg_positive = (posneg_mask == 2)
-
-    # Marker 增强: 在前景区域中，marker值超过阈值的也视为阳性
-    marker_positive = is_foreground & (marker_gray > marker_thresh)
+    # === Step 2: 确定阳性像素（Seg阳性 OR Marker阳性） ===
 
     if debug_dir is not None:
         # Seg 阳性像素（绿色）
         seg_pos_vis = np.zeros((*seg_array.shape[:2], 3), dtype=np.uint8)
         seg_pos_vis[seg_positive] = [0, 255, 0]
         _save_debug("cr_step2a_seg_positive.png", seg_pos_vis)
-        # Marker 对比图：绿=交集，黄=仅Marker，红=仅Seg
+        # Marker 对比图：绿=两者，黄=Marker补充，红=仅Seg；三者都进入并集
         marker_vis = np.zeros((*seg_array.shape[:2], 3), dtype=np.uint8)
         marker_vis[seg_positive & ~marker_positive] = [255, 0, 0]
         marker_vis[marker_positive & ~seg_positive] = [255, 255, 0]
         marker_vis[seg_positive & marker_positive] = [0, 255, 0]
         _save_debug("cr_step2b_marker_enhanced.png", marker_vis)
 
-    # 联合: 两者取交集
-    positive_pixels = (seg_positive & marker_positive).astype(np.uint8) * 255
+    # 联合: Marker 作为 Seg 的补充，两者取并集
+    positive_pixels = masks["combined_positive"].astype(np.uint8) * 255
 
     if debug_dir is not None:
         _save_debug("cr_step2c_combined_positive.png", positive_pixels)
 
     print(f"    [Connected Region] Seg positive pixels: {np.sum(seg_positive)}, "
           f"Marker positive: {np.sum(marker_positive)}, "
-          f"Intersection: {np.sum(seg_positive & marker_positive)}, "
+          f"Union: {np.sum(seg_positive | marker_positive)}, "
           f"Total: {np.sum(positive_pixels > 0)}")
 
     # === Step 3: 形态学闭运算 — 连接相邻阳性像素 ===
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                        (morphology_kernel, morphology_kernel))
     positive_pixels = cv2.morphologyEx(positive_pixels, cv2.MORPH_CLOSE, kernel, iterations=2)
+    morph_closed = positive_pixels.copy() if return_debug_masks else None
 
     if debug_dir is not None:
         _save_debug("cr_step3_morph_close.png", positive_pixels)
@@ -756,6 +1080,7 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
     # === Step 4: 形态学开运算 — 去除小噪点 ===
     kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     positive_pixels = cv2.morphologyEx(positive_pixels, cv2.MORPH_OPEN, kernel_open)
+    morph_opened = positive_pixels.copy() if return_debug_masks else None
 
     if debug_dir is not None:
         _save_debug("cr_step4_morph_open.png", positive_pixels)
@@ -767,9 +1092,6 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
     for region_id in range(1, num_labels):
         region_mask = (labels == region_id)
         coords = np.argwhere(region_mask)  # (N, 2) [row, col]
-
-        if len(coords) < min_area:
-            continue
 
         rows, cols = coords[:, 0], coords[:, 1]
         center = (int(rows.mean()), int(cols.mean()))
@@ -802,5 +1124,14 @@ def extract_connected_positive_regions(seg_array: np.ndarray,
             cc_vis[rows_i, cols_i] = cc_vis[rows_i, cols_i] * 0.4 + color * 0.6
         _save_debug(f"cr_step5_connected_regions_{len(regions_info)}.png",
                     cc_vis.astype(np.uint8))
+
+    if return_debug_masks:
+        debug_masks = dict(masks)
+        debug_masks.update({
+            "morph_closed": morph_closed,
+            "morph_opened": morph_opened,
+            "labels": labels,
+        })
+        return regions_info, debug_masks
 
     return regions_info

@@ -39,7 +39,8 @@ class DeepLIIFProcessor:
             resolution: "10x", "20x", or "40x"
 
         Returns:
-            list of dicts, each with 'Seg' and 'Marker' PIL Images
+            list of dicts, each with 'Seg', 'Marker', and optionally 'DAPI'
+            PIL Images
         """
         return self._engine.inference_batch(
             tile_pils,
@@ -48,12 +49,16 @@ class DeepLIIFProcessor:
         )
 
     def cache_result(self, tile_name: str, seg_np: np.ndarray,
-                     marker_np: np.ndarray) -> None:
-        """Save DeepLIIF Seg/Marker result to cache directory (async)."""
+                     marker_np: np.ndarray,
+                     dapi_np: Optional[np.ndarray] = None) -> None:
+        """Save DeepLIIF Seg/Marker/DAPI result to cache directory (async)."""
         if self._saver is None:
             return
+        payload = {'Seg': seg_np, 'Marker': marker_np}
+        if dapi_np is not None:
+            payload['DAPI'] = dapi_np
         self._saver.submit(
-            {'Seg': seg_np, 'Marker': marker_np},
+            payload,
             os.path.join(self.cache_dir, f"{tile_name}.npy"),
             allow_pickle=True,
         )

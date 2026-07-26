@@ -334,9 +334,10 @@ positive_cells_info = extract_connected_positive_regions(
     seg_thresh=args.seg_thresh,
     marker_thresh=args.marker_thresh,
     morphology_kernel=args.morphology_kernel,
-    min_area=args.min_mask_area,
 )
 ```
+
+Seg 分支使用前景内 `R >= B` 的阳性像素，Marker 分支使用 `Marker > marker_thresh` 的像素。两个分支取并集，Marker 可以补充 Seg 没有保留的区域。该并集进入形态学处理和连通域提取；连通域提取本身不按面积过滤。
 
 ### 中间数据
 
@@ -352,6 +353,7 @@ clusters = get_clusters_from_cells(positive_cells_info)
 ```
 
 `clusters` 是 SAM2 的 prompt 数据。每个 cluster 通常是一组二维坐标点。
+真正构建 SAM mask prompt 时，才使用 `min_mask_area` 跳过过小的 cluster。
 
 ### 输出数据
 
@@ -463,7 +465,7 @@ sam_mask_merged, _, _, _ = merge_connected_masks(
     sam_mask,
     scores,
     item.positive_cells_info,
-    min_area=200,
+    min_area=0,
 )
 ```
 

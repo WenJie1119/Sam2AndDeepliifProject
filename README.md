@@ -51,12 +51,15 @@ cd34-microvessel-detection/
     ↓
 [DeepLIIF 推理] → DAPI, Hema, Marker, Seg
     ↓
-[细胞提取] → 前景检测 → R/B 分类 → Marker 增强 → 阳性细胞
+[Prompt 构建] → Seg/Marker -5..5 加权 mask → 伪影/碎片/孤立小块过滤 → 强阳性点
     ↓
-[SAM2 精细化] → 实例分割掩码
+[SAM2 精细化] → weighted mask + 强阳性点 → 连通实例掩码
     ↓
-[导出] → LabelMe JSON / CSV / 可视化对比图
+[Center-valid 拼接] → GeoJSON
 ```
+
+当前主流程只支持 `weighted-points`：Seg/Marker 加权 mask 加强阳性点，
+不再保留逐连通域二值 mask 回退路径。
 
 ## 安装
 
@@ -78,11 +81,20 @@ pip install -e ".[tile]"
 # 完整 pipeline
 python scripts/pipeline/run_wsi_pipeline.py \
     --wsi-path data/input/slide.ndpi \
-    --output-dir data/output \
-    --use-connected-regions --save-npy
+    --output-dir data/output
 
 # 仅运行 DeepLIIF
 python scripts/pipeline/run_deepliif_only.py --img data/input/sample.png
+```
+
+区域验证：
+
+```bash
+# 默认读取 config/cell_main.json
+python -m cell.main
+
+# 也可以临时覆盖 config 中的字段
+python -m cell.main --weighted-dab-min-intensity 125
 ```
 
 ## 参数说明

@@ -240,8 +240,7 @@ def write_center_valid_debug_outputs(records: list[dict], output_root: str,
         JSON-serializable metadata for the stitched debug outputs.
     """
     from cd34_pipeline.cell.extraction import (
-        compute_marker_threshold,
-        compute_posneg_mask,
+        compute_positive_masks,
         extract_connected_positive_regions,
     )
 
@@ -258,20 +257,17 @@ def write_center_valid_debug_outputs(records: list[dict], output_root: str,
     _save_rgb(os.path.join(out_dir, "09_stitched_deepliif_marker.png"),
               marker_canvas)
 
-    if marker_canvas.ndim == 3:
-        marker_gray = cv2.cvtColor(marker_canvas, cv2.COLOR_RGB2GRAY)
-    else:
-        marker_gray = marker_canvas.copy()
-
-    effective_marker_thresh = marker_thresh
-    if effective_marker_thresh is None:
-        effective_marker_thresh = compute_marker_threshold(
-            marker_gray, percentile_factor=marker_percentile_factor)
-
-    posneg_mask, is_foreground, _ = compute_posneg_mask(seg_canvas, seg_thresh)
-    seg_positive = posneg_mask == 2
-    marker_positive = is_foreground & (marker_gray > effective_marker_thresh)
-    combined_positive = seg_positive & marker_positive
+    masks = compute_positive_masks(
+        seg_canvas,
+        marker_canvas,
+        seg_thresh=seg_thresh,
+        marker_thresh=marker_thresh,
+        marker_percentile_factor=marker_percentile_factor,
+    )
+    effective_marker_thresh = masks["marker_thresh"]
+    seg_positive = masks["seg_positive"]
+    marker_positive = masks["marker_positive"]
+    combined_positive = masks["combined_positive"]
 
     seg_pos_vis = np.zeros_like(seg_canvas, dtype=np.uint8)
     seg_pos_vis[seg_positive] = [0, 255, 0]
@@ -306,6 +302,7 @@ def write_center_valid_debug_outputs(records: list[dict], output_root: str,
 
     metadata.update({
         "marker_thresh": int(effective_marker_thresh),
+        "combine_logic": "seg_or_marker",
         "seg_positive_pixels": int(seg_positive.sum()),
         "marker_positive_pixels": int(marker_positive.sum()),
         "combined_positive_pixels": int(combined_positive.sum()),

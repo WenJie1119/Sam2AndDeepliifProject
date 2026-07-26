@@ -11,15 +11,13 @@ from cell.utils import AsyncSaver
 
 
 class SAM2Processor:
-    """Wraps SAM2 model for batch point-prompt segmentation."""
+    """Wraps SAM2 model for weighted mask + point-prompt segmentation."""
 
     def __init__(self, config: str, checkpoint: str, device: str,
-                 batch_size: int = 32, min_area: int = 50,
-                 score_threshold: float = 0.1,
+                 batch_size: int = 32, score_threshold: float = 0.1,
                  cache_dir: Optional[str] = None,
                  reuse_cache_dir: Optional[str] = None):
         self.batch_size = batch_size
-        self.min_area = min_area
         self.score_threshold = score_threshold
         self.cache_dir = cache_dir
         self.reuse_cache_dir = reuse_cache_dir
@@ -44,202 +42,136 @@ class SAM2Processor:
             print(f"[SAM2] Cache enabled -> {cache_dir}")
         print(f"[SAM2] Loaded on {device}")
 
-    def segment(self, tile_np: np.ndarray, clusters: list,
-                tile_name: str = None,
-                positive_cells_info: list = None,
-                debug_dir: Optional[str] = None) -> tuple[np.ndarray, list]:
-        """
-        Run SAM2 batch segmentation on a single tile.
-
-        Args:
-            tile_np: RGB image (H, W, 3)
-            clusters: list of (N,2) coordinate arrays
-            debug_dir: If set, switches to the per-prompt path
-                (run_sam2_segmentation) so it can write
-                ``{debug_dir}/sam2_steps/instance_XXX/*`` for each cluster.
-                Slower; only used in single-tile --debug-vis mode.
-
-        Returns:
-            (sam_mask, scores): raw mask array and score list
-        """
-        from cd34_pipeline.sam2_wrapper.inference import (
-            run_sam2_segmentation_batch, run_sam2_segmentation,
-        )
-
-        if self.reuse_cache_dir is not None:
-            if tile_name is None or positive_cells_info is None:
-                raise ValueError("tile_name and positive_cells_info are required for SAM2 cache reuse")
-            return self._load_cached_result(tile_name, positive_cells_info)
-
-        if debug_dir is not None:
-            sam_mask, scores, _ = run_sam2_segmentation(
-                self._predictor, tile_np, clusters,
-                min_area=self.min_area,
-                set_image=True,
-                score_threshold=self.score_threshold,
-                debug_dir=debug_dir,
-            )
-            return sam_mask, scores
-
-        sam_mask, scores, _ = run_sam2_segmentation_batch(
-            self._predictor, tile_np, clusters,
-            min_area=self.min_area,
-            set_image=True,
-            batch_size=self.batch_size,
-            score_threshold=self.score_threshold,
-        )
-        return sam_mask, scores
-
     def segment_batch(self, items: list) -> list[tuple[np.ndarray, list]]:
-        """
-        Run SAM2 multi-image batch segmentation.
+        """Run weighted mask + point prompts for each tile."""
+        return [self._segment_weighted_points(item) for item in items]
 
-        Uses set_image_batch() to encode all images in one ViT forward,
-        then processes each image's prompts through the decoder.
-
-        When cache is enabled, inference runs with score_threshold=0 so that
-        all instances (including low-confidence ones) are preserved in the
-        cached .npy files.  The configured threshold is then re-applied before
-        returning results to the pipeline.
-
-        Args:
-            items: list of BucketItem (each has .tile_np and .clusters)
-
-        Returns:
-            list of (sam_mask, scores) tuples, one per item
-        """
-        from cd34_pipeline.sam2_wrapper.inference import run_sam2_multi_image_batch
-
+    def _segment_weighted_points(self, item) -> tuple[np.ndarray, list]:
+        """Run one tile with a dense weighted mask plus positive points."""
+        if item.mask_input is None:
+            raise ValueError("weighted-points mode requires mask_input")
         if self.reuse_cache_dir is not None:
-            return [
-                self._load_cached_result(item.tile_name, item.positive_cells_info)
-                for item in items
-            ]
+            return self._load_cached_weighted_result(item.tile_name)
 
-        images = [item.tile_np for item in items]
-        clusters_list = [item.clusters for item in items]
+        self._predictor.set_image(item.tile_np)
+        predict_args = {
+            "mask_input": item.mask_input,
+            "multimask_output": True,
+        }
+        point_coords = item.point_coords
+        if point_coords is not None and len(point_coords) > 0:
+            predict_args["point_coords"] = point_coords
+            predict_args["point_labels"] = item.point_labels
 
-        # When caching, run without score filtering to preserve all instances
-        infer_threshold = 0.0 if self.cache_dir else self.score_threshold
+        masks, candidate_scores, low_res_masks = self._predictor.predict(
+            **predict_args)
+        candidate_scores = np.asarray(candidate_scores, dtype=np.float32)
+        best_idx = int(np.argmax(candidate_scores))
+        best_score = float(candidate_scores[best_idx])
+        best_mask = masks[best_idx].astype(bool)
+        instance_mask = np.zeros(best_mask.shape, dtype=np.uint16)
+        instance_mask[best_mask] = 1
+        scores = [(1, best_score)]
 
-        raw_results = run_sam2_multi_image_batch(
-            self._predictor, images, clusters_list,
-            min_area=self.min_area,
-            prompt_batch_size=self.batch_size,
-            score_threshold=infer_threshold,
+        if item.prompt_debug_dir is not None:
+            self._save_weighted_prediction_debug(
+                item, masks, candidate_scores, low_res_masks, best_idx)
+
+        if self.cache_dir is not None:
+            self._cache_weighted_result(item.tile_name, instance_mask, scores)
+        if self.score_threshold > 0 and best_score < self.score_threshold:
+            instance_mask.fill(0)
+            scores = []
+        return instance_mask, scores
+
+    @staticmethod
+    def _save_weighted_prediction_debug(item, masks: np.ndarray,
+                                        scores: np.ndarray,
+                                        low_res_masks: np.ndarray,
+                                        best_idx: int) -> None:
+        import cv2
+        import json
+
+        output_dir = item.prompt_debug_dir
+        os.makedirs(output_dir, exist_ok=True)
+        for name in os.listdir(output_dir):
+            if name.startswith("step4_weighted_"):
+                path = os.path.join(output_dir, name)
+                if os.path.isfile(path):
+                    os.remove(path)
+
+        image = item.tile_np[:, :, :3]
+        for index, (mask, score) in enumerate(zip(masks, scores)):
+            pixels = mask.astype(bool)
+            overlay = image.copy()
+            overlay[pixels] = (
+                overlay[pixels].astype(np.float32) * 0.45
+                + np.array([255, 0, 0], dtype=np.float32) * 0.55
+            ).clip(0, 255).astype(np.uint8)
+            cv2.imwrite(
+                os.path.join(
+                    output_dir,
+                    f"step4_weighted_candidate_{index}_score_{score:.4f}.png",
+                ),
+                cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR),
+            )
+
+        np.save(
+            os.path.join(output_dir, "step4_weighted_low_res_masks.npy"),
+            low_res_masks,
         )
+        summary = {
+            "prompt_mode": "weighted-points",
+            "point_count": int(
+                len(item.point_coords) if item.point_coords is not None else 0),
+            "scores": [float(score) for score in scores],
+            "candidate_areas": [int(mask.astype(bool).sum()) for mask in masks],
+            "best_idx": int(best_idx),
+            "best_score": float(scores[best_idx]),
+            "best_area": int(masks[best_idx].astype(bool).sum()),
+        }
+        with open(
+            os.path.join(output_dir, "step4_weighted_summary.json"),
+            "w", encoding="utf-8",
+        ) as output:
+            json.dump(summary, output, indent=2)
 
-        if self.cache_dir is None:
-            return [(mask, scores) for mask, scores, _ in raw_results]
-
-        # Cache unfiltered results, then apply threshold for pipeline
-        pipeline_results = []
-        for item, (mask, scores, _) in zip(items, raw_results):
-            self._cache_result(item.tile_name, mask, scores)
-            if self.score_threshold > 0:
-                mask, scores = self._apply_threshold(
-                    mask, scores, self.score_threshold)
-            pipeline_results.append((mask, scores))
-        return pipeline_results
-
-    def _cache_result(self, tile_name: str, sam_mask: np.ndarray,
-                      scores: list) -> None:
-        """Save unfiltered SAM2 mask + scores to cache directory."""
-        self._saver.submit(
-            {'sam_mask': sam_mask, 'scores': scores},
-            os.path.join(self.cache_dir, f"{tile_name}.npy"),
-            allow_pickle=True,
-        )
-
-    def _load_cached_result(self, tile_name: str,
-                            positive_cells_info: list) -> tuple[np.ndarray, list]:
-        """Load old SAM2 cache and remap selected original region IDs."""
+    def _load_cached_weighted_result(self, tile_name: str) -> tuple[np.ndarray, list]:
         cache_path = os.path.join(self.reuse_cache_dir, f"{tile_name}.npy")
         if not os.path.exists(cache_path):
             raise FileNotFoundError(f"SAM2 cache file not found: {cache_path}")
-
         cached = np.load(cache_path, allow_pickle=True)
         if isinstance(cached, np.ndarray) and cached.shape == ():
             cached = cached.item()
-        if not isinstance(cached, dict) or 'sam_mask' not in cached or 'scores' not in cached:
+        if not isinstance(cached, dict):
             raise ValueError(f"Invalid SAM2 cache format: {cache_path}")
+        if cached.get("prompt_mode") != "weighted-points":
+            raise ValueError(
+                f"SAM2 cache was not produced by weighted-points mode: "
+                f"{cache_path}")
+        mask = cached.get("sam_mask")
+        scores = cached.get("scores")
+        if mask is None or scores is None:
+            raise ValueError(f"Invalid SAM2 cache format: {cache_path}")
+        return self._apply_threshold(mask, list(scores), self.score_threshold)
 
-        old_mask = cached['sam_mask']
-        old_scores = cached['scores']
-        score_by_old_id = {int(inst_id): float(score) for inst_id, score in old_scores}
-
-        remapped = np.zeros_like(old_mask)
-        remapped_scores = []
-        selected_old_ids = []
-
-        for new_id, cell in enumerate(positive_cells_info, start=1):
-            old_id = int(cell.get('id', new_id))
-            score = score_by_old_id.get(old_id)
-            if score is None:
-                print(f"      [SAM2 cache] {tile_name}: region {old_id} missing in cache [SKIPPED]")
-                continue
-            if score < self.score_threshold:
-                print(f"      [SAM2 cache] {tile_name}: region {old_id} score={score:.4f} "
-                      f"[FILTERED: score<{self.score_threshold}]")
-                continue
-
-            remapped[old_mask == old_id] = new_id
-            remapped_scores.append((new_id, score))
-            selected_old_ids.append(old_id)
-
-        if not remapped_scores:
-            remapped, remapped_scores, selected_old_ids = self._remap_cached_by_overlap(
-                old_mask, score_by_old_id, positive_cells_info)
-
-        print(f"      [SAM2 cache] {tile_name}: reused {len(remapped_scores)} "
-              f"instances from old region IDs {selected_old_ids}")
-        return remapped, remapped_scores
-
-    def _remap_cached_by_overlap(self, old_mask: np.ndarray,
-                                 score_by_old_id: dict[int, float],
-                                 positive_cells_info: list) -> tuple[np.ndarray, list, list]:
-        """
-        Fallback for caches produced by an older extraction order.
-
-        Keep cached SAM2 instances that spatially overlap the new candidate
-        prompt union. This avoids trusting stale instance IDs when the candidate
-        extraction changed between runs.
-        """
-        prompt_union = np.zeros(old_mask.shape, dtype=bool)
-        for cell in positive_cells_info:
-            coords = cell['coords']
-            prompt_union[coords[:, 0], coords[:, 1]] = True
-
-        remapped = np.zeros_like(old_mask)
-        remapped_scores = []
-        selected_old_ids = []
-        next_id = 1
-
-        for old_id in sorted(int(i) for i in np.unique(old_mask) if int(i) > 0):
-            score = score_by_old_id.get(old_id)
-            if score is None or score < self.score_threshold:
-                continue
-            inst_mask = old_mask == old_id
-            overlap_pixels = int(np.logical_and(inst_mask, prompt_union).sum())
-            if overlap_pixels < self.min_area:
-                continue
-
-            remapped[inst_mask] = next_id
-            remapped_scores.append((next_id, score))
-            selected_old_ids.append(old_id)
-            next_id += 1
-
-        if selected_old_ids:
-            print("      [SAM2 cache] IDs did not match current candidate "
-                  "regions; used spatial-overlap fallback")
-
-        return remapped, remapped_scores, selected_old_ids
+    def _cache_weighted_result(self, tile_name: str, sam_mask: np.ndarray,
+                               scores: list) -> None:
+        self._saver.submit(
+            {
+                "prompt_mode": "weighted-points",
+                "sam_mask": sam_mask,
+                "scores": scores,
+            },
+            os.path.join(self.cache_dir, f"{tile_name}.npy"),
+            allow_pickle=True,
+        )
 
     @staticmethod
     def _apply_threshold(mask: np.ndarray, scores: list,
                          threshold: float = None) -> tuple[np.ndarray, list]:
         """Remove instances below score threshold from mask."""
-        if threshold is None:
+        if threshold is None or threshold <= 0:
             return mask, scores
         kept_scores = []
         mask = mask.copy()

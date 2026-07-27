@@ -46,6 +46,20 @@ class SegmentationBackendTests(unittest.TestCase):
                 batch_size=1,
             )
 
+    def test_sam3_factory_uses_optional_backend(self):
+        with patch("cell.sam3.SAM3Processor", _FakeProcessor):
+            backend = create_segmentation_backend(
+                "sam3",
+                config="unused",
+                checkpoint="sam3.pt",
+                device="cuda:1",
+                batch_size=2,
+            )
+
+        self.assertIsInstance(backend, SegmentationBackend)
+        self.assertEqual(backend.kwargs["checkpoint"], "sam3.pt")
+        self.assertEqual(backend.kwargs["device"], "cuda:1")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -44,7 +44,18 @@ def create_segmentation_backend(
             cache_dir=cache_dir,
             reuse_cache_dir=reuse_cache_dir,
         )
+    if normalized == "sam3":
+        from cell.sam3 import SAM3Processor
+
+        return SAM3Processor(
+            config=config,
+            checkpoint=checkpoint,
+            device=device,
+            batch_size=batch_size,
+            cache_dir=cache_dir,
+            reuse_cache_dir=reuse_cache_dir,
+        )
     raise ValueError(
         f"Unsupported segmentation backend: {backend!r}. "
-        "Available backends: sam2"
+        "Available backends: sam2, sam3"
     )

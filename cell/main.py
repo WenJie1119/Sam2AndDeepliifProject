@@ -248,7 +248,8 @@ def parse_args(argv: Optional[list[str]] = None):
     p.add_argument("--sam-config", type=str,
                    default="configs/sam2.1/sam2.1_hiera_l.yaml")
     p.add_argument(
-        "--sam-backend", type=str, default="sam2", choices=["sam2"],
+        "--sam-backend", type=str, default="sam2",
+        choices=["sam2", "sam3"],
         help="Prompt-driven segmentation backend (default: sam2).")
 
     # -- Device --
@@ -1524,7 +1525,7 @@ def main():
     print(f"  SAM backend:       {args.sam_backend}")
     print(f"  ROI JSON:          {args.roi_json}")
     print(f"  DeepLIIF batch_size: {args.deepliif_batch_size}")
-    print(f"  SAM2 batch_size:   {args.sam2_batch_size}")
+    print(f"  SAM batch_size:    {args.sam2_batch_size}")
     print(f"  Bucket capacity:   {args.bucket_capacity} iterations "
           f"(queue={queue_capacity} items)")
     print(f"  Cache DeepLIIF:    {'ON' if args.cache_deepliif else 'OFF'}")

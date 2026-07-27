@@ -51,7 +51,7 @@ from cell.utils import (Bucket, BucketItem, StickyProgress,
                         enumerate_debug_region_tiles,
                         apply_crop_region_slice, generate_metrics_plots)
 from cell.deepliif import DeepLIIFProcessor
-from cell.sam2 import SAM2Processor
+from cell.segmentation_backend import create_segmentation_backend
 from cell.postprocess import PostProcessor
 
 
@@ -247,6 +247,9 @@ def parse_args(argv: Optional[list[str]] = None):
                    default="./data/models/sam2/sam2.1_hiera_large.pt")
     p.add_argument("--sam-config", type=str,
                    default="configs/sam2.1/sam2.1_hiera_l.yaml")
+    p.add_argument(
+        "--sam-backend", type=str, default="sam2", choices=["sam2"],
+        help="Prompt-driven segmentation backend (default: sam2).")
 
     # -- Device --
     p.add_argument("--device", type=str, default="cuda:0",
@@ -1190,7 +1193,8 @@ class Consumer:
         args = self.args
 
         # -- Init processors --
-        sam2 = SAM2Processor(
+        sam2 = create_segmentation_backend(
+            args.sam_backend,
             config=args.sam_config,
             checkpoint=args.sam_checkpoint,
             device=args.device,
@@ -1453,7 +1457,8 @@ def run_single_tile_debug(args):
 
     # -- Load models once --
     deepliif = DeepLIIFProcessor(args.deepliif_model_dir, args.device)
-    sam2 = SAM2Processor(
+    sam2 = create_segmentation_backend(
+        args.sam_backend,
         config=args.sam_config,
         checkpoint=args.sam_checkpoint,
         device=args.device,
@@ -1516,6 +1521,7 @@ def main():
     print(f"  WSI:               {args.wsi_path}")
     print(f"  Output:            {args.output_dir}")
     print(f"  Device:            {args.device}")
+    print(f"  SAM backend:       {args.sam_backend}")
     print(f"  ROI JSON:          {args.roi_json}")
     print(f"  DeepLIIF batch_size: {args.deepliif_batch_size}")
     print(f"  SAM2 batch_size:   {args.sam2_batch_size}")

@@ -54,6 +54,7 @@ output/
 outputs/
 cell_test_output/
 debug.log
+config/local*.json
 
 # Tool configs
 .claude/

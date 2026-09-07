@@ -33,6 +33,7 @@ deepliif_models/*.pt
 data/input/
 data/output/
 data/CD34InputData/
+CD34HumanData/
 test_results/
 debug_output/
 debug_outputs/
